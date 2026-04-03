@@ -1,6 +1,20 @@
-import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type ComponentPropsWithoutRef,
+} from "react";
 import { fetchMasteryCatalog } from "./lib/masteryCatalog";
-import { fetchPrimeCatalog, fetchPrimePrice } from "./lib/warframeMarket";
+import {
+  fetchPrimeCatalog,
+  fetchPrimePrice,
+  isPriceSnapshotStale,
+  loadCachedPriceSnapshots,
+  PriceFetchError,
+} from "./lib/warframeMarket";
 import {
   loadFromStorage,
   removeFromStorageByPrefix,
@@ -14,14 +28,19 @@ import type {
   MasteryGroupId,
   MasteryItem,
   MarketItem,
+  PriceRequestMeta,
   PriceSnapshot,
 } from "./types";
 
 const INVENTORY_KEY = "wf-prime-tracker:inventory:v1";
 const LANGUAGE_KEY = "wf-prime-tracker:language:v1";
 const MASTERY_PROGRESS_KEY = "wf-prime-tracker:mastery-progress:v1";
+const PRICE_REQUEST_META_KEY = "wf-prime-tracker:price-request-meta:v1";
 const APP_STORAGE_PREFIX = "wf-prime-tracker:";
-const REQUEST_DELAY_MS = 350;
+const PRICE_QUEUE_CONCURRENCY = 2;
+const PRICE_QUEUE_DELAY_MS = 180;
+const PRICE_GENERAL_RETRY_MS = 60 * 1000;
+const PRICE_ERROR_COOLDOWN_MS = 7 * 60 * 1000;
 const MASTERY_PAGE_CHUNK_SIZE = 48;
 
 type AppSection = "inventory" | "pricing" | "ducats" | "mastery" | "settings";
@@ -116,6 +135,33 @@ const PRICING_MASTERY_FILTERS: Array<{
   { id: "mastered", label: "Освоено" },
   { id: "unmastered", label: "Не освоено" },
 ];
+
+interface PriceQueueJob {
+  item: Pick<InventoryItem, "slug" | "name">;
+  force: boolean;
+  source: "auto" | "manual";
+  started: boolean;
+  cancelled: boolean;
+  controller: AbortController | null;
+  promise: Promise<PriceSnapshot | null>;
+  resolve: (snapshot: PriceSnapshot | null) => void;
+  reject: (error: Error) => void;
+}
+
+interface InventoryImportEntry {
+  name: string;
+  count: number;
+}
+
+interface MasteryImportEntry {
+  name: string;
+  isMastery: boolean;
+}
+
+interface ImportFeedback {
+  tone: "success" | "error";
+  message: string;
+}
 
 function InventorySectionIcon() {
   return (
@@ -465,8 +511,40 @@ function SectionIcon({ section }: { section: AppSection }) {
   return <SettingsSectionIcon />;
 }
 
-function wait(ms: number) {
-  return new Promise((resolve) => window.setTimeout(resolve, ms));
+function FadeInImage({
+  className,
+  onLoad,
+  src,
+  ...props
+}: ComponentPropsWithoutRef<"img">) {
+  const [isLoaded, setIsLoaded] = useState(false);
+  const imageRef = useRef<HTMLImageElement | null>(null);
+
+  useEffect(() => {
+    setIsLoaded(false);
+  }, [src]);
+
+  useEffect(() => {
+    const image = imageRef.current;
+
+    if (image?.complete && image.naturalWidth > 0) {
+      setIsLoaded(true);
+    }
+  }, [src]);
+
+  return (
+    <img
+      {...props}
+      ref={imageRef}
+      className={className ? `fade-in-image ${className}` : "fade-in-image"}
+      src={src}
+      data-loaded={isLoaded ? "true" : "false"}
+      onLoad={(event) => {
+        setIsLoaded(true);
+        onLoad?.(event);
+      }}
+    />
+  );
 }
 
 function getMarketItemUrl(slug: string) {
@@ -485,7 +563,7 @@ function formatPlatinum(value: number | null) {
   return (
     <span className="price-value">
       <span>{value.toFixed(0)}</span>
-      <img
+      <FadeInImage
         className="platinum-icon"
         src="/platinumIcon.webp"
         alt=""
@@ -544,6 +622,91 @@ function normalizeLookupText(value: string) {
   return value.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
+function normalizeImportName(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/ё/g, "е")
+    .replace(/["'`’]/g, "")
+    .replace(/[(){}\[\],.;:_/\\+-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function addLookupNameEntry<T>(lookup: Map<string, T>, rawName: string | undefined, value: T) {
+  if (!rawName) {
+    return;
+  }
+
+  const normalizedName = normalizeImportName(rawName);
+
+  if (!normalizedName || lookup.has(normalizedName)) {
+    return;
+  }
+
+  lookup.set(normalizedName, value);
+}
+
+function isInventoryImportEntry(value: unknown): value is InventoryImportEntry {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  const candidate = value as Record<string, unknown>;
+
+  return (
+    typeof candidate.name === "string" &&
+    typeof candidate.count === "number" &&
+    Number.isFinite(candidate.count)
+  );
+}
+
+function isMasteryImportEntry(value: unknown): value is MasteryImportEntry {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  const candidate = value as Record<string, unknown>;
+
+  return (
+    typeof candidate.name === "string" &&
+    typeof candidate.isMastery === "boolean"
+  );
+}
+
+function summarizeMissingNames(names: string[]) {
+  if (names.length === 0) {
+    return "";
+  }
+
+  const preview = names.slice(0, 4).join(", ");
+  const suffix = names.length > 4 ? ` и ещё ${names.length - 4}` : "";
+  return ` Не найдено: ${preview}${suffix}.`;
+}
+
+function buildMarketItemLookup(items: MarketItem[]) {
+  const lookup = new Map<string, MarketItem>();
+
+  for (const item of items) {
+    addLookupNameEntry(lookup, item.name, item);
+    addLookupNameEntry(lookup, item.names.en, item);
+    addLookupNameEntry(lookup, item.names.ru, item);
+  }
+
+  return lookup;
+}
+
+function buildMasteryItemLookup(items: MasteryItem[]) {
+  const lookup = new Map<string, MasteryItem>();
+
+  for (const item of items) {
+    addLookupNameEntry(lookup, item.name, item);
+    addLookupNameEntry(lookup, item.names.en, item);
+    addLookupNameEntry(lookup, item.names.ru, item);
+  }
+
+  return lookup;
+}
+
 function compareNullableNumbers(
   left: number | null,
   right: number | null,
@@ -562,6 +725,29 @@ function compareNullableNumbers(
   }
 
   return direction === "asc" ? left - right : right - left;
+}
+
+function createAbortError() {
+  return new DOMException("Запрос отменен", "AbortError");
+}
+
+function isAbortError(error: unknown) {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+function isRetryablePriceError(error: unknown) {
+  return (
+    error instanceof PriceFetchError &&
+    (error.status === 429 || (error.status !== null && error.status >= 500))
+  );
+}
+
+function isCooldownActive(meta: PriceRequestMeta | null | undefined) {
+  if (!meta?.retryAfterAt) {
+    return false;
+  }
+
+  return new Date(meta.retryAfterAt).getTime() > Date.now();
 }
 
 function getLocalizedName(
@@ -608,7 +794,7 @@ function ItemPreview({
       <div className="item-card-media blueprint-media">
         <div className="blueprint-core" />
         {item.assets?.badge && (
-          <img
+          <FadeInImage
             className="blueprint-badge"
             src={item.assets.badge}
             alt=""
@@ -622,7 +808,7 @@ function ItemPreview({
   return (
     <div className="item-card-media">
       {item.assets?.thumb ? (
-        <img
+        <FadeInImage
           className="item-card-image"
           src={item.assets.thumb}
           alt={localizedName}
@@ -631,7 +817,7 @@ function ItemPreview({
         <div className="item-card-fallback" />
       )}
       {item.assets?.badge && (
-        <img
+        <FadeInImage
           className="item-card-badge"
           src={item.assets.badge}
           alt=""
@@ -661,7 +847,7 @@ function MasteryItemPreview({
   return (
     <div className="item-card-media mastery-media">
       {currentImageUrl ? (
-        <img
+        <FadeInImage
           className="item-card-image mastery-card-image"
           src={currentImageUrl}
           alt={localizedName}
@@ -705,7 +891,7 @@ function ItemTablePreview({
       <div className="item-thumb item-thumb-blueprint">
         <div className="item-thumb-blueprint-core" />
         {item.assets?.badge && (
-          <img
+          <FadeInImage
             className="item-thumb-blueprint-badge"
             src={item.assets.badge}
             alt=""
@@ -719,7 +905,7 @@ function ItemTablePreview({
   return (
     <div className="item-thumb">
       {item.assets?.thumb ? (
-        <img
+        <FadeInImage
           className="item-thumb-image"
           src={item.assets.thumb}
           alt={localizedName}
@@ -728,7 +914,7 @@ function ItemTablePreview({
         <div className="item-thumb-fallback" />
       )}
       {item.assets?.badge && (
-        <img
+        <FadeInImage
           className="item-thumb-badge"
           src={item.assets.badge}
           alt=""
@@ -793,7 +979,14 @@ export default function App() {
     loadFromStorage<AppLocale>(LANGUAGE_KEY, "ru"),
   );
   const [activeSection, setActiveSection] = useState<AppSection>("inventory");
-  const [priceMap, setPriceMap] = useState<Record<string, PriceSnapshot>>({});
+  const [priceMap, setPriceMap] = useState<Record<string, PriceSnapshot>>(() =>
+    loadCachedPriceSnapshots(),
+  );
+  const [priceRequestMetaMap, setPriceRequestMetaMap] = useState<
+    Record<string, PriceRequestMeta>
+  >(() =>
+    loadFromStorage<Record<string, PriceRequestMeta>>(PRICE_REQUEST_META_KEY, {}),
+  );
   const [loadingSlugs, setLoadingSlugs] = useState<Set<string>>(new Set());
   const [errors, setErrors] = useState<Record<string, string | null>>({});
   const [isBulkRefreshing, setIsBulkRefreshing] = useState(false);
@@ -810,6 +1003,10 @@ export default function App() {
     useState<MasteryStatusFilter>("pending");
   const [masteryPrimeFilter, setMasteryPrimeFilter] =
     useState<MasteryPrimeFilter>("all");
+  const [inventoryImportFeedback, setInventoryImportFeedback] =
+    useState<ImportFeedback | null>(null);
+  const [masteryImportFeedback, setMasteryImportFeedback] =
+    useState<ImportFeedback | null>(null);
   const [masteryProgress, setMasteryProgress] = useState<Record<string, boolean>>(
     () => loadFromStorage<Record<string, boolean>>(MASTERY_PROGRESS_KEY, {}),
   );
@@ -834,9 +1031,66 @@ export default function App() {
     direction: "desc",
   });
   const masteryLoadMoreRef = useRef<HTMLDivElement | null>(null);
+  const inventoryImportInputRef = useRef<HTMLInputElement | null>(null);
+  const masteryImportInputRef = useRef<HTMLInputElement | null>(null);
+  const isMountedRef = useRef(true);
+  const masteryCatalogRequestRef = useRef<Promise<MasteryItem[]> | null>(null);
+  const queuedPriceJobsRef = useRef<Map<string, PriceQueueJob>>(new Map());
+  const queuedPriceSlugsRef = useRef<string[]>([]);
+  const activePriceRequestsRef = useRef(0);
+  const activeTargetSlugsRef = useRef<Set<string>>(new Set());
   const deferredMasterySearch = useDeferredValue(
     masterySearch.trim().toLowerCase(),
   );
+  const catalogImportLookup = useMemo(() => buildMarketItemLookup(catalog), [catalog]);
+  const masteryImportLookup = useMemo(
+    () => buildMasteryItemLookup(masteryCatalog),
+    [masteryCatalog],
+  );
+
+  async function ensureMasteryCatalogLoaded() {
+    if (masteryCatalogState === "ready" && masteryCatalog.length > 0) {
+      return masteryCatalog;
+    }
+
+    if (masteryCatalogRequestRef.current) {
+      return masteryCatalogRequestRef.current;
+    }
+
+    const request = (async () => {
+      try {
+        setMasteryCatalogState("loading");
+        const items = await fetchMasteryCatalog();
+
+        setMasteryCatalog(items);
+        setMasteryCatalogState("ready");
+        setMasteryCatalogError(null);
+
+        return items;
+      } catch (error) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Не удалось загрузить список mastery-предметов";
+
+        setMasteryCatalogState("error");
+        setMasteryCatalogError(message);
+        throw error instanceof Error ? error : new Error(message);
+      } finally {
+        masteryCatalogRequestRef.current = null;
+      }
+    })();
+
+    masteryCatalogRequestRef.current = request;
+
+    return request;
+  }
+
+  useEffect(() => {
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     saveToStorage(INVENTORY_KEY, inventory);
@@ -849,6 +1103,10 @@ export default function App() {
   useEffect(() => {
     saveToStorage(MASTERY_PROGRESS_KEY, masteryProgress);
   }, [masteryProgress]);
+
+  useEffect(() => {
+    saveToStorage(PRICE_REQUEST_META_KEY, priceRequestMetaMap);
+  }, [priceRequestMetaMap]);
 
   useEffect(() => {
     async function loadCatalog() {
@@ -910,83 +1168,298 @@ export default function App() {
       return;
     }
 
-    async function loadMasteryItems() {
-      try {
-        setMasteryCatalogState("loading");
-        const items = await fetchMasteryCatalog();
-
-        setMasteryCatalog(items);
-        setMasteryCatalogState("ready");
-        setMasteryCatalogError(null);
-      } catch (error) {
-        setMasteryCatalogState("error");
-        setMasteryCatalogError(
-          error instanceof Error
-            ? error.message
-            : "Не удалось загрузить список mastery-предметов",
-        );
-      }
-    }
-
-    void loadMasteryItems();
+    void ensureMasteryCatalogLoaded();
   }, [activeSection, masteryCatalogState]);
 
   useEffect(() => {
     setVisibleMasteryCount(MASTERY_PAGE_CHUNK_SIZE);
   }, [deferredMasterySearch, masteryGroup, masteryPrimeFilter, masteryStatusFilter]);
 
-  async function refreshItem(item: Pick<InventoryItem, "slug" | "name">, force = false) {
-    setLoadingSlugs((current) => new Set(current).add(item.slug));
-    setErrors((current) => ({ ...current, [item.slug]: null }));
+  function cancelPriceJob(slug: string) {
+    const job = queuedPriceJobsRef.current.get(slug);
 
-    try {
-      const snapshot = await fetchPrimePrice(item, { force });
-      setPriceMap((current) => ({ ...current, [item.slug]: snapshot }));
-    } catch (error) {
-      setErrors((current) => ({
-        ...current,
-        [item.slug]:
-          error instanceof Error ? error.message : "Не удалось получить цену",
-      }));
-    } finally {
+    if (!job) {
+      return;
+    }
+
+    job.cancelled = true;
+    queuedPriceJobsRef.current.delete(slug);
+    queuedPriceSlugsRef.current = queuedPriceSlugsRef.current.filter(
+      (queuedSlug) => queuedSlug !== slug,
+    );
+
+    if (job.started && job.controller) {
+      job.controller.abort();
+    } else {
+      job.reject(createAbortError());
+    }
+
+    if (isMountedRef.current) {
       setLoadingSlugs((current) => {
         const next = new Set(current);
-        next.delete(item.slug);
+        next.delete(slug);
         return next;
       });
     }
   }
 
+  function cancelAutoPriceJobs(targetSlugs: Set<string>) {
+    for (const [slug, job] of queuedPriceJobsRef.current.entries()) {
+      if (job.source === "auto" && !targetSlugs.has(slug)) {
+        cancelPriceJob(slug);
+      }
+    }
+  }
+
+  function processPriceQueue() {
+    while (activePriceRequestsRef.current < PRICE_QUEUE_CONCURRENCY) {
+      const slug = queuedPriceSlugsRef.current.shift();
+
+      if (!slug) {
+        return;
+      }
+
+      const job = queuedPriceJobsRef.current.get(slug);
+
+      if (!job || job.started || job.cancelled) {
+        continue;
+      }
+
+      if (job.source === "auto" && !activeTargetSlugsRef.current.has(slug)) {
+        cancelPriceJob(slug);
+        continue;
+      }
+
+      job.started = true;
+      job.controller = new AbortController();
+      activePriceRequestsRef.current += 1;
+      setLoadingSlugs((current) => new Set(current).add(slug));
+      setErrors((current) => ({ ...current, [slug]: null }));
+      const attemptAt = new Date().toISOString();
+
+      setPriceRequestMetaMap((current) => ({
+        ...current,
+        [slug]: {
+          lastAttemptAt: attemptAt,
+          lastSuccessAt: current[slug]?.lastSuccessAt ?? null,
+          retryAfterAt: current[slug]?.retryAfterAt ?? null,
+          lastErrorStatus: null,
+          lastErrorMessage: null,
+        },
+      }));
+
+      void fetchPrimePrice(job.item, {
+        force: job.force,
+        signal: job.controller.signal,
+      })
+        .then((snapshot) => {
+          const isCurrentJob = queuedPriceJobsRef.current.get(slug) === job;
+
+          if (isMountedRef.current && isCurrentJob && !job.cancelled && snapshot) {
+            setPriceMap((current) => ({ ...current, [slug]: snapshot }));
+            setPriceRequestMetaMap((current) => ({
+              ...current,
+              [slug]: {
+                lastAttemptAt: snapshot.lastAttemptAt ?? attemptAt,
+                lastSuccessAt: snapshot.lastSuccessAt ?? snapshot.updatedAt,
+                retryAfterAt: null,
+                lastErrorStatus: null,
+                lastErrorMessage: null,
+              },
+            }));
+          }
+
+          job.resolve(snapshot);
+        })
+        .catch((error: unknown) => {
+          if (isAbortError(error) || job.cancelled) {
+            job.resolve(null);
+            return;
+          }
+
+          const normalizedError =
+            error instanceof Error
+              ? error
+              : new Error("Не удалось получить цену");
+          const isCurrentJob = queuedPriceJobsRef.current.get(slug) === job;
+          const retryAfterAt = new Date(
+            Date.now() +
+              (isRetryablePriceError(normalizedError)
+                ? PRICE_ERROR_COOLDOWN_MS
+                : PRICE_GENERAL_RETRY_MS),
+          ).toISOString();
+          const lastErrorStatus =
+            normalizedError instanceof PriceFetchError
+              ? normalizedError.status
+              : null;
+
+          if (isMountedRef.current && isCurrentJob) {
+            setErrors((current) => ({
+              ...current,
+              [slug]: normalizedError.message,
+            }));
+            setPriceRequestMetaMap((current) => ({
+              ...current,
+              [slug]: {
+                lastAttemptAt: attemptAt,
+                lastSuccessAt: current[slug]?.lastSuccessAt ?? null,
+                retryAfterAt,
+                lastErrorStatus,
+                lastErrorMessage: normalizedError.message,
+              },
+            }));
+          }
+
+          job.reject(normalizedError);
+        })
+        .finally(() => {
+          activePriceRequestsRef.current = Math.max(
+            0,
+            activePriceRequestsRef.current - 1,
+          );
+          const currentJob = queuedPriceJobsRef.current.get(slug);
+
+          if (currentJob === job) {
+            queuedPriceJobsRef.current.delete(slug);
+          }
+
+          if (isMountedRef.current) {
+            setLoadingSlugs((current) => {
+              const next = new Set(current);
+              next.delete(slug);
+              return next;
+            });
+
+            window.setTimeout(() => {
+              if (isMountedRef.current) {
+                processPriceQueue();
+              }
+            }, PRICE_QUEUE_DELAY_MS);
+          }
+        });
+    }
+  }
+
+  function queuePriceRefresh(
+    item: Pick<InventoryItem, "slug" | "name">,
+    options?: { force?: boolean; source?: "auto" | "manual" },
+  ) {
+    const requestMeta = priceRequestMetaMap[item.slug];
+
+    if (isCooldownActive(requestMeta)) {
+      const retryAt = requestMeta?.retryAfterAt
+        ? new Intl.DateTimeFormat("ru-RU", {
+            hour: "2-digit",
+            minute: "2-digit",
+          }).format(new Date(requestMeta.retryAfterAt))
+        : null;
+      const cooldownError = new Error(
+        retryAt
+          ? `Повторный запрос временно отключен до ${retryAt}`
+          : "Повторный запрос временно отключен",
+      );
+
+      if (options?.source === "manual") {
+        setErrors((current) => ({
+          ...current,
+          [item.slug]: cooldownError.message,
+        }));
+      }
+
+      return Promise.reject(cooldownError);
+    }
+
+    const existingJob = queuedPriceJobsRef.current.get(item.slug);
+
+    if (existingJob) {
+      if (!existingJob.started && options?.force) {
+        existingJob.force = true;
+      }
+
+      if (options?.source === "manual") {
+        existingJob.source = "manual";
+      }
+
+      return existingJob.promise;
+    }
+
+    let resolveJob!: (snapshot: PriceSnapshot | null) => void;
+    let rejectJob!: (error: Error) => void;
+    const promise = new Promise<PriceSnapshot | null>((resolve, reject) => {
+      resolveJob = resolve;
+      rejectJob = reject;
+    });
+
+    queuedPriceJobsRef.current.set(item.slug, {
+      item,
+      force: !!options?.force,
+      source: options?.source ?? "auto",
+      started: false,
+      cancelled: false,
+      controller: null,
+      promise,
+      resolve: resolveJob,
+      reject: rejectJob,
+    });
+    queuedPriceSlugsRef.current.push(item.slug);
+    processPriceQueue();
+
+    return promise;
+  }
+
+  async function refreshItem(item: Pick<InventoryItem, "slug" | "name">, force = false) {
+    try {
+      return await queuePriceRefresh(item, { force, source: "manual" });
+    } catch {
+      return null;
+    }
+  }
+
   useEffect(() => {
-    if (inventory.length === 0) {
-      return;
-    }
+    const inventorySlugs = new Set(inventory.map((item) => item.slug));
 
-    const missingPrices = inventory.filter((item) => !priceMap[item.slug]);
-
-    if (missingPrices.length === 0) {
-      return;
-    }
-
-    let cancelled = false;
-
-    async function hydrateMissingPrices() {
-      for (const item of missingPrices) {
-        if (cancelled) {
-          return;
-        }
-
-        await refreshItem(item);
-        await wait(REQUEST_DELAY_MS);
+    for (const slug of [...queuedPriceJobsRef.current.keys()]) {
+      if (!inventorySlugs.has(slug)) {
+        cancelPriceJob(slug);
       }
     }
 
-    void hydrateMissingPrices();
+    setPriceMap((current) => {
+      const nextEntries = Object.entries(current).filter(([slug]) =>
+        inventorySlugs.has(slug),
+      );
 
-    return () => {
-      cancelled = true;
-    };
-  }, [inventory, priceMap]);
+      if (nextEntries.length === Object.keys(current).length) {
+        return current;
+      }
+
+      return Object.fromEntries(nextEntries);
+    });
+
+    setPriceRequestMetaMap((current) => {
+      const nextEntries = Object.entries(current).filter(([slug]) =>
+        inventorySlugs.has(slug),
+      );
+
+      if (nextEntries.length === Object.keys(current).length) {
+        return current;
+      }
+
+      return Object.fromEntries(nextEntries);
+    });
+
+    setErrors((current) => {
+      const nextEntries = Object.entries(current).filter(([slug]) =>
+        inventorySlugs.has(slug),
+      );
+
+      if (nextEntries.length === Object.keys(current).length) {
+        return current;
+      }
+
+      return Object.fromEntries(nextEntries);
+    });
+  }, [inventory]);
 
   const suggestions = useMemo(() => {
     const normalizedSearch = search.trim().toLowerCase();
@@ -1313,6 +1786,64 @@ export default function App() {
     );
   }, [ducatRows]);
 
+  const autoRefreshItems = useMemo(() => {
+    if (activeSection === "pricing") {
+      return pricingRows.map(({ row }) => ({
+        slug: row.slug,
+        name: row.name,
+      }));
+    }
+
+    if (activeSection === "ducats") {
+      return ducatRows.map(({ row }) => ({
+        slug: row.slug,
+        name: row.name,
+      }));
+    }
+
+    return [];
+  }, [activeSection, ducatRows, pricingRows]);
+
+  useEffect(() => {
+    const targetSlugs = new Set(autoRefreshItems.map((item) => item.slug));
+    activeTargetSlugsRef.current = targetSlugs;
+    cancelAutoPriceJobs(targetSlugs);
+
+    if (activeSection !== "pricing" && activeSection !== "ducats") {
+      return;
+    }
+
+    const itemsToRefresh = autoRefreshItems.filter((item) => {
+      if (queuedPriceJobsRef.current.has(item.slug) || loadingSlugs.has(item.slug)) {
+        return false;
+      }
+
+      if (isCooldownActive(priceRequestMetaMap[item.slug])) {
+        return false;
+      }
+
+      const snapshot = priceMap[item.slug] ?? null;
+
+      return snapshot === null || isPriceSnapshotStale(snapshot);
+    });
+
+    if (itemsToRefresh.length === 0) {
+      return;
+    }
+
+    void Promise.allSettled(
+      itemsToRefresh.map((item) =>
+        queuePriceRefresh(item, { source: "auto" }),
+      ),
+    );
+  }, [
+    activeSection,
+    autoRefreshItems,
+    loadingSlugs,
+    priceMap,
+    priceRequestMetaMap,
+  ]);
+
   const filteredMasteryItems = useMemo(() => {
     return masteryCatalog
       .filter((item) => {
@@ -1448,6 +1979,7 @@ export default function App() {
   }
 
   function removeItem(slug: string) {
+    cancelPriceJob(slug);
     setInventory((current) => current.filter((item) => item.slug !== slug));
     setErrors((current) => {
       const next = { ...current };
@@ -1455,6 +1987,11 @@ export default function App() {
       return next;
     });
     setPriceMap((current) => {
+      const next = { ...current };
+      delete next[slug];
+      return next;
+    });
+    setPriceRequestMetaMap((current) => {
       const next = { ...current };
       delete next[slug];
       return next;
@@ -1488,6 +2025,190 @@ export default function App() {
 
       return next;
     });
+  }
+
+  async function handleInventoryImportChange(event: ChangeEvent<HTMLInputElement>) {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    input.value = "";
+
+    if (!file) {
+      return;
+    }
+
+    setInventoryImportFeedback(null);
+
+    if (catalogState !== "ready" || catalogImportLookup.size === 0) {
+      setInventoryImportFeedback({
+        tone: "error",
+        message: "Каталог прайм-предметов ещё не загружен. Повтори импорт через пару секунд.",
+      });
+      return;
+    }
+
+    try {
+      const raw = JSON.parse(await file.text()) as unknown;
+
+      if (!Array.isArray(raw)) {
+        throw new Error("JSON должен быть массивом объектов вида { name, count }.");
+      }
+
+      const validEntries = raw.filter(isInventoryImportEntry);
+      const invalidCount = raw.length - validEntries.length;
+
+      if (validEntries.length === 0) {
+        throw new Error("В файле нет ни одной корректной записи формата { name, count }.");
+      }
+
+      const importedItems = new Map<string, InventoryItem>();
+      const missingNames: string[] = [];
+
+      for (const entry of validEntries) {
+        const normalizedName = normalizeImportName(entry.name);
+        const matchedItem = catalogImportLookup.get(normalizedName);
+        const quantity = Math.max(1, Math.round(entry.count));
+
+        if (!normalizedName || !matchedItem) {
+          missingNames.push(entry.name);
+          continue;
+        }
+
+        const existing = importedItems.get(matchedItem.slug);
+
+        importedItems.set(matchedItem.slug, {
+          slug: matchedItem.slug,
+          name: matchedItem.name,
+          names: matchedItem.names,
+          assets: matchedItem.assets,
+          ducats: matchedItem.ducats,
+          quantity: existing ? existing.quantity + quantity : quantity,
+        });
+      }
+
+      if (importedItems.size === 0) {
+        throw new Error(
+          `Не удалось сопоставить ни одного предмета с каталогом.${summarizeMissingNames(missingNames)}`,
+        );
+      }
+
+      const importedList = [...importedItems.values()];
+      const importedSlugSet = new Set(importedList.map((item) => item.slug));
+
+      setInventory((current) => {
+        const currentMap = new Map(current.map((item) => [item.slug, item]));
+        const nextImported = importedList.map((item) => ({
+          ...(currentMap.get(item.slug) ?? {}),
+          ...item,
+          quantity: item.quantity,
+        }));
+
+        return [
+          ...nextImported,
+          ...current.filter((item) => !importedSlugSet.has(item.slug)),
+        ];
+      });
+
+      const invalidSuffix =
+        invalidCount > 0 ? ` Пропущено некорректных записей: ${invalidCount}.` : "";
+
+      setInventoryImportFeedback({
+        tone: "success",
+        message: `Импортировано ${importedList.length} позиций.${invalidSuffix}${summarizeMissingNames(missingNames)}`,
+      });
+    } catch (error) {
+      setInventoryImportFeedback({
+        tone: "error",
+        message:
+          error instanceof Error
+            ? error.message
+            : "Не удалось прочитать файл инвентаря.",
+      });
+    }
+  }
+
+  async function handleMasteryImportChange(event: ChangeEvent<HTMLInputElement>) {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    input.value = "";
+
+    if (!file) {
+      return;
+    }
+
+    setMasteryImportFeedback(null);
+
+    try {
+      const raw = JSON.parse(await file.text()) as unknown;
+
+      if (!Array.isArray(raw)) {
+        throw new Error("JSON должен быть массивом объектов вида { name, isMastery }.");
+      }
+
+      const validEntries = raw.filter(isMasteryImportEntry);
+      const invalidCount = raw.length - validEntries.length;
+
+      if (validEntries.length === 0) {
+        throw new Error(
+          "В файле нет ни одной корректной записи формата { name, isMastery }.",
+        );
+      }
+
+      const masteryItems = await ensureMasteryCatalogLoaded();
+      const lookup =
+        masteryItems === masteryCatalog && masteryImportLookup.size > 0
+          ? masteryImportLookup
+          : buildMasteryItemLookup(masteryItems);
+      const updates = new Map<string, boolean>();
+      const missingNames: string[] = [];
+
+      for (const entry of validEntries) {
+        const normalizedName = normalizeImportName(entry.name);
+        const matchedItem = lookup.get(normalizedName);
+
+        if (!normalizedName || !matchedItem) {
+          missingNames.push(entry.name);
+          continue;
+        }
+
+        updates.set(matchedItem.id, entry.isMastery);
+      }
+
+      if (updates.size === 0) {
+        throw new Error(
+          `Не удалось сопоставить ни одного mastery-предмета.${summarizeMissingNames(missingNames)}`,
+        );
+      }
+
+      setMasteryProgress((current) => {
+        const next = { ...current };
+
+        for (const [itemId, isMastery] of updates) {
+          if (isMastery) {
+            next[itemId] = true;
+          } else {
+            delete next[itemId];
+          }
+        }
+
+        return next;
+      });
+
+      const invalidSuffix =
+        invalidCount > 0 ? ` Пропущено некорректных записей: ${invalidCount}.` : "";
+
+      setMasteryImportFeedback({
+        tone: "success",
+        message: `Обновлено ${updates.size} mastery-предметов.${invalidSuffix}${summarizeMissingNames(missingNames)}`,
+      });
+    } catch (error) {
+      setMasteryImportFeedback({
+        tone: "error",
+        message:
+          error instanceof Error
+            ? error.message
+            : "Не удалось прочитать файл освоенных предметов.",
+      });
+    }
   }
 
   function togglePricingSort(key: PricingSortKey) {
@@ -1552,10 +2273,19 @@ export default function App() {
     }
 
     removeFromStorageByPrefix(APP_STORAGE_PREFIX);
+    for (const slug of [...queuedPriceJobsRef.current.keys()]) {
+      cancelPriceJob(slug);
+    }
+    queuedPriceSlugsRef.current = [];
+    activePriceRequestsRef.current = 0;
+    activeTargetSlugsRef.current = new Set();
     setInventory([]);
     setSearch("");
     setLanguage("ru");
+    setInventoryImportFeedback(null);
+    setMasteryImportFeedback(null);
     setPriceMap({});
+    setPriceRequestMetaMap({});
     setLoadingSlugs(new Set());
     setErrors({});
     setIsBulkRefreshing(false);
@@ -1583,10 +2313,11 @@ export default function App() {
     setIsBulkRefreshing(true);
 
     try {
-      for (const item of inventory) {
-        await refreshItem(item, force);
-        await wait(REQUEST_DELAY_MS);
-      }
+      await Promise.allSettled(
+        inventory.map((item) =>
+          queuePriceRefresh(item, { force, source: "manual" }),
+        ),
+      );
     } finally {
       setIsBulkRefreshing(false);
     }
@@ -1597,6 +2328,9 @@ export default function App() {
       <main className="page app-layout">
         <aside className="app-sidebar">
           <div className="sidebar-brand">
+            <div className="sidebar-brand-mark" aria-hidden="true">
+              <FadeInImage src="/app-icon.svg" alt="" />
+            </div>
             <span className="sidebar-kicker">Разделы</span>
             <strong>Prime Tracker</strong>
           </div>
@@ -1707,7 +2441,6 @@ export default function App() {
                           </strong>
                           <span>{item.slug}</span>
                         </div>
-                        <span className="item-card-action">Добавить</span>
                       </button>
                     ))}
                   </div>
@@ -2426,49 +3159,172 @@ export default function App() {
             </>
           ) : (
             <section className="panel settings-panel">
-              <div className="settings-list">
-                <article className="settings-item">
-                  <div className="settings-copy">
-                    <strong>Язык названий предметов</strong>
+              <div className="settings-groups">
+                <section className="settings-group">
+                  <div className="settings-group-header">
+                    <h2>Интерфейс</h2>
+                    <p>Базовые параметры отображения данных во всех вкладках приложения.</p>
+                  </div>
+
+                  <div className="settings-list">
+                    <article className="settings-item">
+                      <div className="settings-copy">
+                        <strong>Язык названий предметов</strong>
+                        <p>
+                          Переключает отображение названий между русским и английским
+                          во всех вкладках.
+                        </p>
+                      </div>
+
+                      <button
+                        className={`language-switch ${language === "en" ? "is-english" : "is-russian"}`}
+                        type="button"
+                        aria-label="Переключить язык названий"
+                        role="switch"
+                        aria-checked={language === "en"}
+                        onClick={() =>
+                          setLanguage((current) => (current === "ru" ? "en" : "ru"))
+                        }
+                      >
+                        <span className="language-switch-thumb" aria-hidden="true" />
+                        <span className="language-switch-option">RU</span>
+                        <span className="language-switch-option">EN</span>
+                      </button>
+                    </article>
+                  </div>
+                </section>
+
+                <section className="settings-group">
+                  <div className="settings-group-header">
+                    <h2>Загрузка данных</h2>
                     <p>
-                      Переключает отображение названий между русским и английским
-                      во всех вкладках.
+                      Импортируй сохранённые JSON-файлы, чтобы быстро восстановить
+                      инвентарь и прогресс освоения.
                     </p>
                   </div>
 
-                  <button
-                    className={`language-switch ${language === "en" ? "is-english" : "is-russian"}`}
-                    type="button"
-                    aria-label="Переключить язык названий"
-                    role="switch"
-                    aria-checked={language === "en"}
-                    onClick={() =>
-                      setLanguage((current) => (current === "ru" ? "en" : "ru"))
-                    }
-                  >
-                    <span className="language-switch-thumb" aria-hidden="true" />
-                    <span className="language-switch-option">RU</span>
-                    <span className="language-switch-option">EN</span>
-                  </button>
-                </article>
+                  <div className="settings-list">
+                    <article className="settings-item">
+                      <div className="settings-copy">
+                        <strong>Импорт инвентаря</strong>
+                        <p>
+                          Загружает JSON-массив в формате <code>{`[{ "name": "", "count": 2 }]`}</code>.
+                          Для найденных предметов количество обновляется по файлу.
+                        </p>
+                        {catalogState === "loading" && (
+                          <p className="settings-note">
+                            Загружаю каталог прайм-предметов для импорта...
+                          </p>
+                        )}
+                        {catalogState === "error" && (
+                          <p className="settings-status is-error">
+                            {catalogError ?? "Каталог прайм-предметов недоступен."}
+                          </p>
+                        )}
+                        {inventoryImportFeedback && (
+                          <p
+                            className={`settings-status${inventoryImportFeedback.tone === "error" ? " is-error" : " is-success"}`}
+                          >
+                            {inventoryImportFeedback.message}
+                          </p>
+                        )}
+                      </div>
 
-                <article className="settings-item">
-                  <div className="settings-copy">
-                    <strong>Очистить все данные</strong>
-                    <p>
-                      Удаляет инвентарь, прогресс освоения, фильтры, язык и локальные
-                      кеши приложения.
-                    </p>
+                      <div className="settings-actions">
+                        <input
+                          ref={inventoryImportInputRef}
+                          className="file-input-hidden"
+                          type="file"
+                          accept=".json,application/json"
+                          onChange={handleInventoryImportChange}
+                        />
+                        <button
+                          className="ghost-button"
+                          type="button"
+                          onClick={() => {
+                            setInventoryImportFeedback(null);
+                            inventoryImportInputRef.current?.click();
+                          }}
+                          disabled={catalogState !== "ready"}
+                        >
+                          Импорт JSON
+                        </button>
+                      </div>
+                    </article>
+
+                    <article className="settings-item">
+                      <div className="settings-copy">
+                        <strong>Импорт освоенных предметов</strong>
+                        <p>
+                          Загружает JSON-массив в формате <code>{`[{ "name": "", "isMastery": true }]`}</code>.
+                          Для найденных предметов статус освоения обновляется по файлу.
+                        </p>
+                        {masteryCatalogState === "loading" && (
+                          <p className="settings-note">
+                            Загружаю mastery-каталог для сопоставления имен...
+                          </p>
+                        )}
+                        {masteryCatalogState === "error" && masteryCatalogError && (
+                          <p className="settings-note">{masteryCatalogError}</p>
+                        )}
+                        {masteryImportFeedback && (
+                          <p
+                            className={`settings-status${masteryImportFeedback.tone === "error" ? " is-error" : " is-success"}`}
+                          >
+                            {masteryImportFeedback.message}
+                          </p>
+                        )}
+                      </div>
+
+                      <div className="settings-actions">
+                        <input
+                          ref={masteryImportInputRef}
+                          className="file-input-hidden"
+                          type="file"
+                          accept=".json,application/json"
+                          onChange={handleMasteryImportChange}
+                        />
+                        <button
+                          className="ghost-button"
+                          type="button"
+                          onClick={() => {
+                            setMasteryImportFeedback(null);
+                            masteryImportInputRef.current?.click();
+                          }}
+                        >
+                          Импорт JSON
+                        </button>
+                      </div>
+                    </article>
+                  </div>
+                </section>
+
+                <section className="settings-group settings-group-danger">
+                  <div className="settings-group-header">
+                    <h2>Сброс и очистка</h2>
+                    <p>Действия, которые меняют или полностью удаляют локальные данные приложения.</p>
                   </div>
 
-                  <button
-                    className="danger-button"
-                    type="button"
-                    onClick={clearAllData}
-                  >
-                    Очистить все
-                  </button>
-                </article>
+                  <div className="settings-list">
+                    <article className="settings-item">
+                      <div className="settings-copy">
+                        <strong>Очистить все данные</strong>
+                        <p>
+                          Удаляет инвентарь, прогресс освоения, фильтры, язык и локальные
+                          кеши приложения.
+                        </p>
+                      </div>
+
+                      <button
+                        className="danger-button"
+                        type="button"
+                        onClick={clearAllData}
+                      >
+                        Очистить все
+                      </button>
+                    </article>
+                  </div>
+                </section>
               </div>
             </section>
           )}

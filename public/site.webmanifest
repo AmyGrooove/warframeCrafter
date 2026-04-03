@@ -1,0 +1,17 @@
+{
+  "name": "Warframe Prime Tracker",
+  "short_name": "Prime Tracker",
+  "description": "Личный трекер прайм-предметов Warframe с ценами с warframe.market",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f131a",
+  "theme_color": "#151b24",
+  "icons": [
+    {
+      "src": "/app-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

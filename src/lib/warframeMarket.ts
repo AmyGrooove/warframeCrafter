@@ -13,7 +13,17 @@ const ASSET_BASE = "https://warframe.market/static/assets";
 const ITEM_CACHE_KEY = "wf-prime-tracker:item-catalog:v3";
 const PRICE_CACHE_KEY = "wf-prime-tracker:price-cache:v1";
 const DAY_IN_MS = 24 * 60 * 60 * 1000;
-const PRICE_CACHE_MS = 5 * 60 * 1000;
+export const PRICE_CACHE_TTL_MS = 20 * 60 * 1000;
+
+export class PriceFetchError extends Error {
+  status: number | null;
+
+  constructor(message: string, status: number | null) {
+    super(message);
+    this.name = "PriceFetchError";
+    this.status = status;
+  }
+}
 
 interface CachedValue<T> {
   value: T;
@@ -32,6 +42,23 @@ interface OrderPayload {
 
 function isFresh(savedAt: number, ttl: number) {
   return Date.now() - savedAt < ttl;
+}
+
+function getSnapshotTimestamp(
+  snapshot:
+    | Pick<PriceSnapshot, "updatedAt" | "lastSuccessAt">
+    | null
+    | undefined,
+) {
+  if (!snapshot) {
+    return null;
+  }
+
+  const timestamp = new Date(
+    snapshot.lastSuccessAt ?? snapshot.updatedAt,
+  ).getTime();
+
+  return Number.isFinite(timestamp) ? timestamp : null;
 }
 
 function toAssetUrl(path: unknown) {
@@ -274,7 +301,7 @@ export async function fetchPrimeCatalog(): Promise<MarketItem[]> {
 
 export async function fetchPrimePrice(
   item: Pick<MarketItem, "slug" | "name">,
-  options?: { force?: boolean },
+  options?: { force?: boolean; signal?: AbortSignal },
 ): Promise<PriceSnapshot> {
   const cachedPrices = loadFromStorage<Record<string, CachedValue<PriceSnapshot>>>(
     PRICE_CACHE_KEY,
@@ -282,19 +309,25 @@ export async function fetchPrimePrice(
   );
   const cached = cachedPrices[item.slug];
 
-  if (cached && !options?.force && isFresh(cached.savedAt, PRICE_CACHE_MS)) {
+  if (cached && !options?.force && isFresh(cached.savedAt, PRICE_CACHE_TTL_MS)) {
     return cached.value;
   }
 
-  const response = await fetch(`${API_BASE}/orders/item/${item.slug}/top`);
+  const response = await fetch(`${API_BASE}/orders/item/${item.slug}/top`, {
+    signal: options?.signal,
+  });
 
   if (!response.ok) {
-    throw new Error(`Не удалось загрузить цену: ${response.status}`);
+    throw new PriceFetchError(
+      `Не удалось загрузить цену: ${response.status}`,
+      response.status,
+    );
   }
 
   const data = (await response.json()) as unknown;
   const sellOrders = pickOnlineOrders(extractOrders(data, "sell"));
   const buyOrders = pickOnlineOrders(extractOrders(data, "buy"));
+  const now = new Date().toISOString();
 
   const snapshot: PriceSnapshot = {
     slug: item.slug,
@@ -304,7 +337,9 @@ export async function fetchPrimePrice(
     sellOrderCount: sellOrders.length,
     buyOrderCount: buyOrders.length,
     bestSeller: sellOrders[0]?.user?.ingameName ?? null,
-    updatedAt: new Date().toISOString(),
+    updatedAt: now,
+    lastAttemptAt: now,
+    lastSuccessAt: now,
   };
 
   saveToStorage(PRICE_CACHE_KEY, {
@@ -316,4 +351,35 @@ export async function fetchPrimePrice(
   });
 
   return snapshot;
+}
+
+export function loadCachedPriceSnapshots() {
+  const cachedPrices = loadFromStorage<Record<string, CachedValue<PriceSnapshot>>>(
+    PRICE_CACHE_KEY,
+    {},
+  );
+
+  return Object.fromEntries(
+    Object.entries(cachedPrices).flatMap(([slug, cachedValue]) => {
+      if (!cachedValue || typeof cachedValue !== "object" || !cachedValue.value) {
+        return [];
+      }
+
+      return [[slug, cachedValue.value]];
+    }),
+  ) as Record<string, PriceSnapshot>;
+}
+
+export function isPriceSnapshotFresh(snapshot: PriceSnapshot | null | undefined) {
+  const timestamp = getSnapshotTimestamp(snapshot);
+
+  if (timestamp === null) {
+    return false;
+  }
+
+  return Date.now() - timestamp < PRICE_CACHE_TTL_MS;
+}
+
+export function isPriceSnapshotStale(snapshot: PriceSnapshot | null | undefined) {
+  return !isPriceSnapshotFresh(snapshot);
 }

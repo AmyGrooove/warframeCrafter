@@ -64,6 +64,16 @@ export interface PriceSnapshot {
   buyOrderCount: number;
   bestSeller: string | null;
   updatedAt: string;
+  lastAttemptAt?: string | null;
+  lastSuccessAt?: string | null;
+}
+
+export interface PriceRequestMeta {
+  lastAttemptAt: string | null;
+  lastSuccessAt: string | null;
+  retryAfterAt: string | null;
+  lastErrorStatus: number | null;
+  lastErrorMessage: string | null;
 }
 
 export interface InventoryRow extends InventoryItem {

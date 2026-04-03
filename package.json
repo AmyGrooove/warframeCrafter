@@ -4,8 +4,8 @@
   "packageManager": "pnpm@10.29.3",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
-    "build:start": "tsc -b && vite build && vite preview"
+    "build": "tsc --noEmit && vite build",
+    "build:start": "tsc --noEmit && vite build && vite preview"
   },
   "dependencies": {
     "react": "^19.2.4",
