@@ -18,3 +18,23 @@ export function saveToStorage<T>(key: string, value: T) {
     // Ignore storage errors for personal/local use.
   }
 }
+
+export function removeFromStorageByPrefix(prefix: string) {
+  try {
+    const keysToRemove: string[] = [];
+
+    for (let index = 0; index < window.localStorage.length; index += 1) {
+      const key = window.localStorage.key(index);
+
+      if (key?.startsWith(prefix)) {
+        keysToRemove.push(key);
+      }
+    }
+
+    for (const key of keysToRemove) {
+      window.localStorage.removeItem(key);
+    }
+  } catch {
+    // Ignore storage errors for personal/local use.
+  }
+}

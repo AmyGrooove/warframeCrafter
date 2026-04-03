@@ -40,6 +40,10 @@ function toAssetUrl(path: unknown) {
     : null;
 }
 
+function toOptionalNumber(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
 function normalizeItem(record: unknown): MarketItem | null {
   if (!record || typeof record !== "object") {
     return null;
@@ -66,6 +70,10 @@ function normalizeItem(record: unknown): MarketItem | null {
   const thumbPath = russianI18n?.thumb ?? englishI18n?.thumb ?? null;
   const iconPath = russianI18n?.icon ?? englishI18n?.icon ?? null;
   const badgePath = russianI18n?.subIcon ?? englishI18n?.subIcon ?? null;
+  const ducats =
+    toOptionalNumber(candidate.ducats) ??
+    toOptionalNumber(candidate.ducatsValue) ??
+    toOptionalNumber(candidate.ducats_value);
   const name =
     candidate.itemName ??
     candidate.item_name ??
@@ -116,6 +124,7 @@ function normalizeItem(record: unknown): MarketItem | null {
     name: normalizedEnglishName,
     names,
     assets,
+    ducats,
   };
 }
 
