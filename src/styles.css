@@ -485,6 +485,7 @@ button {
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
 }
 
+.progressive-results-meta,
 .mastery-results-meta {
   display: flex;
   align-items: center;
@@ -695,6 +696,7 @@ button {
   color: #daf5e7;
 }
 
+.progressive-load-more,
 .mastery-load-more {
   display: grid;
   justify-items: center;
@@ -702,6 +704,7 @@ button {
   margin-top: 18px;
 }
 
+.progressive-load-sentinel,
 .mastery-load-sentinel {
   width: 100%;
   height: 1px;
@@ -1190,6 +1193,7 @@ button {
     align-items: stretch;
   }
 
+  .progressive-results-meta,
   .mastery-results-meta {
     flex-direction: column;
     align-items: flex-start;

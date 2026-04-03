@@ -41,7 +41,7 @@ const PRICE_QUEUE_CONCURRENCY = 2;
 const PRICE_QUEUE_DELAY_MS = 180;
 const PRICE_GENERAL_RETRY_MS = 60 * 1000;
 const PRICE_ERROR_COOLDOWN_MS = 7 * 60 * 1000;
-const MASTERY_PAGE_CHUNK_SIZE = 48;
+const SECTION_RENDER_CHUNK_SIZE = 48;
 
 type AppSection = "inventory" | "pricing" | "ducats" | "mastery" | "settings";
 type MasteryStatusFilter = "all" | "pending" | "mastered";
@@ -1011,14 +1011,23 @@ export default function App() {
     () => loadFromStorage<Record<string, boolean>>(MASTERY_PROGRESS_KEY, {}),
   );
   const [visibleMasteryCount, setVisibleMasteryCount] = useState(
-    MASTERY_PAGE_CHUNK_SIZE,
+    SECTION_RENDER_CHUNK_SIZE,
+  );
+  const [visibleInventoryCount, setVisibleInventoryCount] = useState(
+    SECTION_RENDER_CHUNK_SIZE,
+  );
+  const [visiblePricingCount, setVisiblePricingCount] = useState(
+    SECTION_RENDER_CHUNK_SIZE,
+  );
+  const [visibleDucatCount, setVisibleDucatCount] = useState(
+    SECTION_RENDER_CHUNK_SIZE,
   );
   const [inventoryMasteryFilter, setInventoryMasteryFilter] =
     useState<PricingMasteryFilter>("all");
   const [pricingMasteryFilter, setPricingMasteryFilter] =
-    useState<PricingMasteryFilter>("all");
+    useState<PricingMasteryFilter>("unmastered");
   const [ducatsMasteryFilter, setDucatsMasteryFilter] =
-    useState<PricingMasteryFilter>("all");
+    useState<PricingMasteryFilter>("unmastered");
   const [pricingSort, setPricingSort] = useState<{
     key: PricingSortKey;
     direction: "asc" | "desc";
@@ -1031,6 +1040,9 @@ export default function App() {
     direction: "desc",
   });
   const masteryLoadMoreRef = useRef<HTMLDivElement | null>(null);
+  const inventoryLoadMoreRef = useRef<HTMLDivElement | null>(null);
+  const pricingLoadMoreRef = useRef<HTMLDivElement | null>(null);
+  const ducatsLoadMoreRef = useRef<HTMLDivElement | null>(null);
   const inventoryImportInputRef = useRef<HTMLInputElement | null>(null);
   const masteryImportInputRef = useRef<HTMLInputElement | null>(null);
   const isMountedRef = useRef(true);
@@ -1172,8 +1184,26 @@ export default function App() {
   }, [activeSection, masteryCatalogState]);
 
   useEffect(() => {
-    setVisibleMasteryCount(MASTERY_PAGE_CHUNK_SIZE);
+    window.scrollTo({ top: 0, behavior: "auto" });
+    document.documentElement.scrollTop = 0;
+    document.body.scrollTop = 0;
+  }, [activeSection]);
+
+  useEffect(() => {
+    setVisibleMasteryCount(SECTION_RENDER_CHUNK_SIZE);
   }, [deferredMasterySearch, masteryGroup, masteryPrimeFilter, masteryStatusFilter]);
+
+  useEffect(() => {
+    setVisibleInventoryCount(SECTION_RENDER_CHUNK_SIZE);
+  }, [inventoryMasteryFilter]);
+
+  useEffect(() => {
+    setVisiblePricingCount(SECTION_RENDER_CHUNK_SIZE);
+  }, [pricingMasteryFilter, pricingSort?.direction, pricingSort?.key]);
+
+  useEffect(() => {
+    setVisibleDucatCount(SECTION_RENDER_CHUNK_SIZE);
+  }, [ducatSort.direction, ducatSort.key, ducatsMasteryFilter]);
 
   function cancelPriceJob(slug: string) {
     const job = queuedPriceJobsRef.current.get(slug);
@@ -1581,6 +1611,11 @@ export default function App() {
       return !entry.masteryStatus;
     });
   }, [inventoryMasteryFilter, rowsWithMastery]);
+  const visibleInventoryRows = useMemo(
+    () => inventoryRows.slice(0, visibleInventoryCount),
+    [inventoryRows, visibleInventoryCount],
+  );
+  const hasMoreInventoryRows = visibleInventoryRows.length < inventoryRows.length;
 
   const pricingRows = useMemo(() => {
     const filteredRows = rowsWithMastery.filter((entry) => {
@@ -1634,6 +1669,11 @@ export default function App() {
       }
     });
   }, [pricingMasteryFilter, pricingSort, rowsWithMastery]);
+  const visiblePricingRows = useMemo(
+    () => pricingRows.slice(0, visiblePricingCount),
+    [pricingRows, visiblePricingCount],
+  );
+  const hasMorePricingRows = visiblePricingRows.length < pricingRows.length;
 
   const pricingTotals = useMemo(() => {
     return pricingRows.reduce(
@@ -1760,6 +1800,11 @@ export default function App() {
       }
     });
   }, [ducatSort, ducatsMasteryFilter, language, rowsWithMastery]);
+  const visibleDucatRows = useMemo(
+    () => ducatRows.slice(0, visibleDucatCount),
+    [ducatRows, visibleDucatCount],
+  );
+  const hasMoreDucatRows = visibleDucatRows.length < ducatRows.length;
 
   const ducatTotals = useMemo(() => {
     return ducatRows.reduce(
@@ -1932,7 +1977,7 @@ export default function App() {
       (entries) => {
         if (entries[0]?.isIntersecting) {
           setVisibleMasteryCount((current) =>
-            Math.min(current + MASTERY_PAGE_CHUNK_SIZE, filteredMasteryItems.length),
+            Math.min(current + SECTION_RENDER_CHUNK_SIZE, filteredMasteryItems.length),
           );
         }
       },
@@ -1947,6 +1992,102 @@ export default function App() {
       observer.disconnect();
     };
   }, [activeSection, filteredMasteryItems.length, hasMoreMasteryItems]);
+
+  useEffect(() => {
+    const target = inventoryLoadMoreRef.current;
+
+    if (
+      activeSection !== "inventory" ||
+      !target ||
+      !hasMoreInventoryRows ||
+      typeof IntersectionObserver === "undefined"
+    ) {
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) {
+          setVisibleInventoryCount((current) =>
+            Math.min(current + SECTION_RENDER_CHUNK_SIZE, inventoryRows.length),
+          );
+        }
+      },
+      {
+        rootMargin: "240px 0px",
+      },
+    );
+
+    observer.observe(target);
+
+    return () => {
+      observer.disconnect();
+    };
+  }, [activeSection, hasMoreInventoryRows, inventoryRows.length]);
+
+  useEffect(() => {
+    const target = pricingLoadMoreRef.current;
+
+    if (
+      activeSection !== "pricing" ||
+      !target ||
+      !hasMorePricingRows ||
+      typeof IntersectionObserver === "undefined"
+    ) {
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) {
+          setVisiblePricingCount((current) =>
+            Math.min(current + SECTION_RENDER_CHUNK_SIZE, pricingRows.length),
+          );
+        }
+      },
+      {
+        rootMargin: "240px 0px",
+      },
+    );
+
+    observer.observe(target);
+
+    return () => {
+      observer.disconnect();
+    };
+  }, [activeSection, hasMorePricingRows, pricingRows.length]);
+
+  useEffect(() => {
+    const target = ducatsLoadMoreRef.current;
+
+    if (
+      activeSection !== "ducats" ||
+      !target ||
+      !hasMoreDucatRows ||
+      typeof IntersectionObserver === "undefined"
+    ) {
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) {
+          setVisibleDucatCount((current) =>
+            Math.min(current + SECTION_RENDER_CHUNK_SIZE, ducatRows.length),
+          );
+        }
+      },
+      {
+        rootMargin: "240px 0px",
+      },
+    );
+
+    observer.observe(target);
+
+    return () => {
+      observer.disconnect();
+    };
+  }, [activeSection, ducatRows.length, hasMoreDucatRows]);
 
   function addItem(item: MarketItem) {
     setInventory((current) => {
@@ -2290,8 +2431,8 @@ export default function App() {
     setErrors({});
     setIsBulkRefreshing(false);
     setInventoryMasteryFilter("all");
-    setPricingMasteryFilter("all");
-    setDucatsMasteryFilter("all");
+    setPricingMasteryFilter("unmastered");
+    setDucatsMasteryFilter("unmastered");
     setPricingSort(null);
     setDucatSort({
       key: "ducatsPerPlatinum",
@@ -2302,7 +2443,10 @@ export default function App() {
     setMasteryGroup("warframes");
     setMasteryStatusFilter("pending");
     setMasteryPrimeFilter("all");
-    setVisibleMasteryCount(MASTERY_PAGE_CHUNK_SIZE);
+    setVisibleMasteryCount(SECTION_RENDER_CHUNK_SIZE);
+    setVisibleInventoryCount(SECTION_RENDER_CHUNK_SIZE);
+    setVisiblePricingCount(SECTION_RENDER_CHUNK_SIZE);
+    setVisibleDucatCount(SECTION_RENDER_CHUNK_SIZE);
   }
 
   async function refreshAll(force = false) {
@@ -2505,49 +2649,81 @@ export default function App() {
                     </p>
                   </div>
                 ) : (
-                  <div className="item-grid owned-grid">
-                    {inventoryRows.map(({ row }) => (
-                      <article key={row.slug} className="item-card owned-card">
-                        <ItemPreview item={row} language={language} />
+                  <>
+                    <div className="progressive-results-meta">
+                      <span>
+                        Показано {visibleInventoryRows.length} из {inventoryRows.length}
+                      </span>
+                    </div>
 
-                        <div className="item-card-body">
-                          <strong>
-                            {getLocalizedName(row.names, row.name, language)}
-                          </strong>
-                          <span>{row.slug}</span>
-                        </div>
+                    <div className="item-grid owned-grid">
+                      {visibleInventoryRows.map(({ row }) => (
+                        <article key={row.slug} className="item-card owned-card">
+                          <ItemPreview item={row} language={language} />
 
-                        <div className="owned-card-footer">
-                          <div className="owned-card-meta">
-                            <label className="card-quantity" aria-label="Количество предметов">
-                              <input
-                                className="quantity-input"
-                                type="number"
-                                min={1}
-                                step={1}
-                                value={row.quantity}
-                                onChange={(event) =>
-                                  changeQuantity(
-                                    row.slug,
-                                    Number.parseInt(event.target.value, 10),
-                                  )
-                                }
-                              />
-                            </label>
-                            <button
-                              className="danger-button icon-button inventory-delete-button"
-                              type="button"
-                              onClick={() => removeItem(row.slug)}
-                              aria-label="Удалить предмет"
-                              title="Удалить предмет"
-                            >
-                              <TrashIcon />
-                            </button>
+                          <div className="item-card-body">
+                            <strong>
+                              {getLocalizedName(row.names, row.name, language)}
+                            </strong>
+                            <span>{row.slug}</span>
                           </div>
-                        </div>
-                      </article>
-                    ))}
-                  </div>
+
+                          <div className="owned-card-footer">
+                            <div className="owned-card-meta">
+                              <label className="card-quantity" aria-label="Количество предметов">
+                                <input
+                                  className="quantity-input"
+                                  type="number"
+                                  min={1}
+                                  step={1}
+                                  value={row.quantity}
+                                  onChange={(event) =>
+                                    changeQuantity(
+                                      row.slug,
+                                      Number.parseInt(event.target.value, 10),
+                                    )
+                                  }
+                                />
+                              </label>
+                              <button
+                                className="danger-button icon-button inventory-delete-button"
+                                type="button"
+                                onClick={() => removeItem(row.slug)}
+                                aria-label="Удалить предмет"
+                                title="Удалить предмет"
+                              >
+                                <TrashIcon />
+                              </button>
+                            </div>
+                          </div>
+                        </article>
+                      ))}
+                    </div>
+
+                    {hasMoreInventoryRows && (
+                      <div className="progressive-load-more">
+                        <button
+                          className="ghost-button"
+                          type="button"
+                          onClick={() =>
+                            setVisibleInventoryCount((current) =>
+                              Math.min(
+                                current + SECTION_RENDER_CHUNK_SIZE,
+                                inventoryRows.length,
+                              ),
+                            )
+                          }
+                        >
+                          Показать еще
+                        </button>
+                        <div
+                          ref={inventoryLoadMoreRef}
+                          className="progressive-load-sentinel"
+                          aria-hidden="true"
+                        />
+                      </div>
+                    )}
+                  </>
                 )}
               </section>
             </div>
@@ -2626,126 +2802,157 @@ export default function App() {
                     </p>
                   </div>
                 ) : (
-                  <div className="table-wrap">
-                    <table className="inventory-table">
-                      <thead>
-                        <tr>
-                          <th>Предмет</th>
-                          <th>Освоение</th>
-                          <th>
-                            <button
-                              className={`table-sort-button${pricingSort?.key === "quantity" ? " is-active" : ""}`}
-                              type="button"
-                              onClick={() => togglePricingSort("quantity")}
-                            >
-                              Кол-во{getPricingSortMarker("quantity")}
-                            </button>
-                          </th>
-                          <th>
-                            <button
-                              className={`table-sort-button${pricingSort?.key === "minSellPrice" ? " is-active" : ""}`}
-                              type="button"
-                              onClick={() => togglePricingSort("minSellPrice")}
-                            >
-                              Мин. продажа{getPricingSortMarker("minSellPrice")}
-                            </button>
-                          </th>
-                          <th>
-                            <button
-                              className={`table-sort-button${pricingSort?.key === "maxBuyPrice" ? " is-active" : ""}`}
-                              type="button"
-                              onClick={() => togglePricingSort("maxBuyPrice")}
-                            >
-                              Макс. покупка{getPricingSortMarker("maxBuyPrice")}
-                            </button>
-                          </th>
-                          <th>
-                            <button
-                              className={`table-sort-button${pricingSort?.key === "total" ? " is-active" : ""}`}
-                              type="button"
-                              onClick={() => togglePricingSort("total")}
-                            >
-                              Сумма{getPricingSortMarker("total")}
-                            </button>
-                          </th>
-                          <th>
-                            <button
-                              className={`table-sort-button${pricingSort?.key === "updatedAt" ? " is-active" : ""}`}
-                              type="button"
-                              onClick={() => togglePricingSort("updatedAt")}
-                            >
-                              Обновлено{getPricingSortMarker("updatedAt")}
-                            </button>
-                          </th>
-                          <th />
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {pricingRows.map(({ row, total, masteryStatus }) => {
+                  <>
+                    <div className="progressive-results-meta">
+                      <span>
+                        Показано {visiblePricingRows.length} из {pricingRows.length}
+                      </span>
+                    </div>
 
-                          return (
-                            <tr key={row.slug}>
-                              <td>
-                                <div className="item-name-row">
-                                  <ItemTablePreview item={row} language={language} />
-                                  <div className="item-name-cell">
-                                    <strong>
-                                      {getLocalizedName(row.names, row.name, language)}
-                                    </strong>
-                                    <span>{row.slug}</span>
-                                    {row.error && (
-                                      <span className="inline-error">{row.error}</span>
-                                    )}
+                    <div className="table-wrap">
+                      <table className="inventory-table">
+                        <thead>
+                          <tr>
+                            <th>Предмет</th>
+                            <th>Освоение</th>
+                            <th>
+                              <button
+                                className={`table-sort-button${pricingSort?.key === "quantity" ? " is-active" : ""}`}
+                                type="button"
+                                onClick={() => togglePricingSort("quantity")}
+                              >
+                                Кол-во{getPricingSortMarker("quantity")}
+                              </button>
+                            </th>
+                            <th>
+                              <button
+                                className={`table-sort-button${pricingSort?.key === "minSellPrice" ? " is-active" : ""}`}
+                                type="button"
+                                onClick={() => togglePricingSort("minSellPrice")}
+                              >
+                                Мин. продажа{getPricingSortMarker("minSellPrice")}
+                              </button>
+                            </th>
+                            <th>
+                              <button
+                                className={`table-sort-button${pricingSort?.key === "maxBuyPrice" ? " is-active" : ""}`}
+                                type="button"
+                                onClick={() => togglePricingSort("maxBuyPrice")}
+                              >
+                                Макс. покупка{getPricingSortMarker("maxBuyPrice")}
+                              </button>
+                            </th>
+                            <th>
+                              <button
+                                className={`table-sort-button${pricingSort?.key === "total" ? " is-active" : ""}`}
+                                type="button"
+                                onClick={() => togglePricingSort("total")}
+                              >
+                                Сумма{getPricingSortMarker("total")}
+                              </button>
+                            </th>
+                            <th>
+                              <button
+                                className={`table-sort-button${pricingSort?.key === "updatedAt" ? " is-active" : ""}`}
+                                type="button"
+                                onClick={() => togglePricingSort("updatedAt")}
+                              >
+                                Обновлено{getPricingSortMarker("updatedAt")}
+                              </button>
+                            </th>
+                            <th />
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {visiblePricingRows.map(({ row, total, masteryStatus }) => {
+                            return (
+                              <tr key={row.slug}>
+                                <td>
+                                  <div className="item-name-row">
+                                    <ItemTablePreview item={row} language={language} />
+                                    <div className="item-name-cell">
+                                      <strong>
+                                        {getLocalizedName(row.names, row.name, language)}
+                                      </strong>
+                                      <span>{row.slug}</span>
+                                      {row.error && (
+                                        <span className="inline-error">{row.error}</span>
+                                      )}
+                                    </div>
                                   </div>
-                                </div>
-                              </td>
-                              <td>
-                                <MasteryStatusIcon status={masteryStatus} />
-                              </td>
-                              <td>{row.quantity}</td>
-                              <td>{formatPlatinum(row.price?.minSellPrice ?? null)}</td>
-                              <td>{formatPlatinum(row.price?.maxBuyPrice ?? null)}</td>
-                              <td>{formatPlatinum(total)}</td>
-                              <td>{formatTimestamp(row.price?.updatedAt ?? null)}</td>
-                              <td>
-                                <div className="row-actions">
-                                  <button
-                                    className="ghost-button icon-button sold-icon-button"
-                                    type="button"
-                                    onClick={() => sellOneItem(row.slug)}
-                                    aria-label="Отметить одну штуку как проданную"
-                                    title="Продано: убрать 1 штуку"
-                                  >
-                                    <SoldIcon />
-                                  </button>
-                                  <button
-                                    className={`ghost-button icon-button${row.status === "loading" ? " is-spinning" : ""}`}
-                                    type="button"
-                                    onClick={() => void refreshItem(row, true)}
-                                    disabled={row.status === "loading"}
-                                    aria-label="Обновить цену"
-                                    title="Обновить цену"
-                                  >
-                                    <RefreshIcon />
-                                  </button>
-                                  <a
-                                    className="ghost-button icon-button"
-                                    href={getMarketItemUrl(row.slug)}
-                                    target="_blank"
-                                    rel="noreferrer"
-                                    aria-label="Открыть на warframe.market"
-                                    title="Открыть на warframe.market"
-                                  >
-                                    <ExternalLinkIcon />
-                                  </a>
-                                </div>
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
+                                </td>
+                                <td>
+                                  <MasteryStatusIcon status={masteryStatus} />
+                                </td>
+                                <td>{row.quantity}</td>
+                                <td>{formatPlatinum(row.price?.minSellPrice ?? null)}</td>
+                                <td>{formatPlatinum(row.price?.maxBuyPrice ?? null)}</td>
+                                <td>{formatPlatinum(total)}</td>
+                                <td>{formatTimestamp(row.price?.updatedAt ?? null)}</td>
+                                <td>
+                                  <div className="row-actions">
+                                    <button
+                                      className="ghost-button icon-button sold-icon-button"
+                                      type="button"
+                                      onClick={() => sellOneItem(row.slug)}
+                                      aria-label="Отметить одну штуку как проданную"
+                                      title="Продано: убрать 1 штуку"
+                                    >
+                                      <SoldIcon />
+                                    </button>
+                                    <button
+                                      className={`ghost-button icon-button${row.status === "loading" ? " is-spinning" : ""}`}
+                                      type="button"
+                                      onClick={() => void refreshItem(row, true)}
+                                      disabled={row.status === "loading"}
+                                      aria-label="Обновить цену"
+                                      title="Обновить цену"
+                                    >
+                                      <RefreshIcon />
+                                    </button>
+                                    <a
+                                      className="ghost-button icon-button"
+                                      href={getMarketItemUrl(row.slug)}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      aria-label="Открыть на warframe.market"
+                                      title="Открыть на warframe.market"
+                                    >
+                                      <ExternalLinkIcon />
+                                    </a>
+                                  </div>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {hasMorePricingRows && (
+                      <div className="progressive-load-more">
+                        <button
+                          className="ghost-button"
+                          type="button"
+                          onClick={() =>
+                            setVisiblePricingCount((current) =>
+                              Math.min(
+                                current + SECTION_RENDER_CHUNK_SIZE,
+                                pricingRows.length,
+                              ),
+                            )
+                          }
+                        >
+                          Показать еще
+                        </button>
+                        <div
+                          ref={pricingLoadMoreRef}
+                          className="progressive-load-sentinel"
+                          aria-hidden="true"
+                        />
+                      </div>
+                    )}
+                  </>
                 )}
               </section>
             </>
@@ -2824,143 +3031,175 @@ export default function App() {
                     </p>
                   </div>
                 ) : (
-                  <div className="table-wrap">
-                    <table className="inventory-table">
-                      <thead>
-                        <tr>
-                          <th>Предмет</th>
-                          <th>Освоение</th>
-                          <th>
-                            <button
-                              className={`table-sort-button${ducatSort.key === "quantity" ? " is-active" : ""}`}
-                              type="button"
-                              onClick={() => toggleDucatSort("quantity")}
-                            >
-                              Кол-во{getDucatSortMarker("quantity")}
-                            </button>
-                          </th>
-                          <th>
-                            <button
-                              className={`table-sort-button${ducatSort.key === "ducats" ? " is-active" : ""}`}
-                              type="button"
-                              onClick={() => toggleDucatSort("ducats")}
-                            >
-                              Дукаты{getDucatSortMarker("ducats")}
-                            </button>
-                          </th>
-                          <th>
-                            <button
-                              className={`table-sort-button${ducatSort.key === "totalDucats" ? " is-active" : ""}`}
-                              type="button"
-                              onClick={() => toggleDucatSort("totalDucats")}
-                            >
-                              Всего дукатов{getDucatSortMarker("totalDucats")}
-                            </button>
-                          </th>
-                          <th>
-                            <button
-                              className={`table-sort-button${ducatSort.key === "minSellPrice" ? " is-active" : ""}`}
-                              type="button"
-                              onClick={() => toggleDucatSort("minSellPrice")}
-                            >
-                              Мин. продажа{getDucatSortMarker("minSellPrice")}
-                            </button>
-                          </th>
-                          <th>
-                            <button
-                              className={`table-sort-button${ducatSort.key === "ducatsPerPlatinum" ? " is-active" : ""}`}
-                              type="button"
-                              onClick={() => toggleDucatSort("ducatsPerPlatinum")}
-                            >
-                              Дукаты / платину{getDucatSortMarker("ducatsPerPlatinum")}
-                            </button>
-                          </th>
-                          <th>
-                            <button
-                              className={`table-sort-button${ducatSort.key === "updatedAt" ? " is-active" : ""}`}
-                              type="button"
-                              onClick={() => toggleDucatSort("updatedAt")}
-                            >
-                              Обновлено{getDucatSortMarker("updatedAt")}
-                            </button>
-                          </th>
-                          <th />
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {ducatRows.map(
-                          ({
-                            row,
-                            masteryStatus,
-                            ducats,
-                            totalDucats,
-                            ducatsPerPlatinum,
-                          }) => {
-                            return (
-                              <tr key={row.slug}>
-                                <td>
-                                  <div className="item-name-row">
-                                    <ItemTablePreview item={row} language={language} />
-                                    <div className="item-name-cell">
-                                      <strong>
-                                        {getLocalizedName(row.names, row.name, language)}
-                                      </strong>
-                                      <span>{row.slug}</span>
-                                      {row.error && (
-                                        <span className="inline-error">{row.error}</span>
-                                      )}
+                  <>
+                    <div className="progressive-results-meta">
+                      <span>
+                        Показано {visibleDucatRows.length} из {ducatRows.length}
+                      </span>
+                    </div>
+
+                    <div className="table-wrap">
+                      <table className="inventory-table">
+                        <thead>
+                          <tr>
+                            <th>Предмет</th>
+                            <th>Освоение</th>
+                            <th>
+                              <button
+                                className={`table-sort-button${ducatSort.key === "quantity" ? " is-active" : ""}`}
+                                type="button"
+                                onClick={() => toggleDucatSort("quantity")}
+                              >
+                                Кол-во{getDucatSortMarker("quantity")}
+                              </button>
+                            </th>
+                            <th>
+                              <button
+                                className={`table-sort-button${ducatSort.key === "ducats" ? " is-active" : ""}`}
+                                type="button"
+                                onClick={() => toggleDucatSort("ducats")}
+                              >
+                                Дукаты{getDucatSortMarker("ducats")}
+                              </button>
+                            </th>
+                            <th>
+                              <button
+                                className={`table-sort-button${ducatSort.key === "totalDucats" ? " is-active" : ""}`}
+                                type="button"
+                                onClick={() => toggleDucatSort("totalDucats")}
+                              >
+                                Всего дукатов{getDucatSortMarker("totalDucats")}
+                              </button>
+                            </th>
+                            <th>
+                              <button
+                                className={`table-sort-button${ducatSort.key === "minSellPrice" ? " is-active" : ""}`}
+                                type="button"
+                                onClick={() => toggleDucatSort("minSellPrice")}
+                              >
+                                Мин. продажа{getDucatSortMarker("minSellPrice")}
+                              </button>
+                            </th>
+                            <th>
+                              <button
+                                className={`table-sort-button${ducatSort.key === "ducatsPerPlatinum" ? " is-active" : ""}`}
+                                type="button"
+                                onClick={() => toggleDucatSort("ducatsPerPlatinum")}
+                              >
+                                Дукаты / платину{getDucatSortMarker("ducatsPerPlatinum")}
+                              </button>
+                            </th>
+                            <th>
+                              <button
+                                className={`table-sort-button${ducatSort.key === "updatedAt" ? " is-active" : ""}`}
+                                type="button"
+                                onClick={() => toggleDucatSort("updatedAt")}
+                              >
+                                Обновлено{getDucatSortMarker("updatedAt")}
+                              </button>
+                            </th>
+                            <th />
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {visibleDucatRows.map(
+                            ({
+                              row,
+                              masteryStatus,
+                              ducats,
+                              totalDucats,
+                              ducatsPerPlatinum,
+                            }) => {
+                              return (
+                                <tr key={row.slug}>
+                                  <td>
+                                    <div className="item-name-row">
+                                      <ItemTablePreview item={row} language={language} />
+                                      <div className="item-name-cell">
+                                        <strong>
+                                          {getLocalizedName(row.names, row.name, language)}
+                                        </strong>
+                                        <span>{row.slug}</span>
+                                        {row.error && (
+                                          <span className="inline-error">{row.error}</span>
+                                        )}
+                                      </div>
                                     </div>
-                                  </div>
-                                </td>
-                                <td>
-                                  <MasteryStatusIcon status={masteryStatus} />
-                                </td>
-                                <td>{row.quantity}</td>
-                                <td>{formatDucats(ducats)}</td>
-                                <td>{formatDucats(totalDucats)}</td>
-                                <td>{formatPlatinum(row.price?.minSellPrice ?? null)}</td>
-                                <td>{formatDucatEfficiency(ducatsPerPlatinum)}</td>
-                                <td>{formatTimestamp(row.price?.updatedAt ?? null)}</td>
-                                <td>
-                                  <div className="row-actions">
-                                    <button
-                                      className="ghost-button icon-button sold-icon-button"
-                                      type="button"
-                                      onClick={() => sellOneItem(row.slug)}
-                                      aria-label="Отметить одну штуку как проданную"
-                                      title="Продано: убрать 1 штуку"
-                                    >
-                                      <SoldIcon />
-                                    </button>
-                                    <button
-                                      className={`ghost-button icon-button${row.status === "loading" ? " is-spinning" : ""}`}
-                                      type="button"
-                                      onClick={() => void refreshItem(row, true)}
-                                      disabled={row.status === "loading"}
-                                      aria-label="Обновить цену"
-                                      title="Обновить цену"
-                                    >
-                                      <RefreshIcon />
-                                    </button>
-                                    <a
-                                      className="ghost-button icon-button"
-                                      href={getMarketItemUrl(row.slug)}
-                                      target="_blank"
-                                      rel="noreferrer"
-                                      aria-label="Открыть на warframe.market"
-                                      title="Открыть на warframe.market"
-                                    >
-                                      <ExternalLinkIcon />
-                                    </a>
-                                  </div>
-                                </td>
-                              </tr>
-                            );
-                          },
-                        )}
-                      </tbody>
-                    </table>
-                  </div>
+                                  </td>
+                                  <td>
+                                    <MasteryStatusIcon status={masteryStatus} />
+                                  </td>
+                                  <td>{row.quantity}</td>
+                                  <td>{formatDucats(ducats)}</td>
+                                  <td>{formatDucats(totalDucats)}</td>
+                                  <td>{formatPlatinum(row.price?.minSellPrice ?? null)}</td>
+                                  <td>{formatDucatEfficiency(ducatsPerPlatinum)}</td>
+                                  <td>{formatTimestamp(row.price?.updatedAt ?? null)}</td>
+                                  <td>
+                                    <div className="row-actions">
+                                      <button
+                                        className="ghost-button icon-button sold-icon-button"
+                                        type="button"
+                                        onClick={() => sellOneItem(row.slug)}
+                                        aria-label="Отметить одну штуку как проданную"
+                                        title="Продано: убрать 1 штуку"
+                                      >
+                                        <SoldIcon />
+                                      </button>
+                                      <button
+                                        className={`ghost-button icon-button${row.status === "loading" ? " is-spinning" : ""}`}
+                                        type="button"
+                                        onClick={() => void refreshItem(row, true)}
+                                        disabled={row.status === "loading"}
+                                        aria-label="Обновить цену"
+                                        title="Обновить цену"
+                                      >
+                                        <RefreshIcon />
+                                      </button>
+                                      <a
+                                        className="ghost-button icon-button"
+                                        href={getMarketItemUrl(row.slug)}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        aria-label="Открыть на warframe.market"
+                                        title="Открыть на warframe.market"
+                                      >
+                                        <ExternalLinkIcon />
+                                      </a>
+                                    </div>
+                                  </td>
+                                </tr>
+                              );
+                            },
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {hasMoreDucatRows && (
+                      <div className="progressive-load-more">
+                        <button
+                          className="ghost-button"
+                          type="button"
+                          onClick={() =>
+                            setVisibleDucatCount((current) =>
+                              Math.min(
+                                current + SECTION_RENDER_CHUNK_SIZE,
+                                ducatRows.length,
+                              ),
+                            )
+                          }
+                        >
+                          Показать еще
+                        </button>
+                        <div
+                          ref={ducatsLoadMoreRef}
+                          className="progressive-load-sentinel"
+                          aria-hidden="true"
+                        />
+                      </div>
+                    )}
+                  </>
                 )}
               </section>
             </>
@@ -3138,7 +3377,7 @@ export default function App() {
                           onClick={() =>
                             setVisibleMasteryCount((current) =>
                               Math.min(
-                                current + MASTERY_PAGE_CHUNK_SIZE,
+                                current + SECTION_RENDER_CHUNK_SIZE,
                                 filteredMasteryItems.length,
                               ),
                             )
