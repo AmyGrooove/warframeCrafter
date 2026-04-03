@@ -73,10 +73,39 @@ function SettingsSectionIcon() {
 
 function RefreshIcon() {
   return (
-    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+    <svg
+      viewBox="0 0 24 24"
+      aria-hidden="true"
+      focusable="false"
+      fill="none"
+    >
       <path
-        d="M12 5a7 7 0 0 1 6.2 3.75V6.5h1.5V12h-5.5v-1.5h3.1A5.5 5.5 0 1 0 17 16.7l1.25.83A7 7 0 1 1 12 5Z"
-        fill="currentColor"
+        d="M19.5 11a7.5 7.5 0 0 0-12.8-5.3L4.75 7.65"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M4.75 4.75v2.9h2.9"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M4.5 13a7.5 7.5 0 0 0 12.8 5.3l1.95-1.95"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M19.25 19.25v-2.9h-2.9"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
       />
     </svg>
   );
@@ -213,6 +242,62 @@ function ItemPreview({
       {item.assets?.badge && (
         <img
           className="item-card-badge"
+          src={item.assets.badge}
+          alt=""
+          aria-hidden="true"
+        />
+      )}
+    </div>
+  );
+}
+
+function ItemTablePreview({
+  item,
+  language,
+}: {
+  item: {
+    slug: string;
+    name: string;
+    names?: Partial<LocalizedNames>;
+    assets?: {
+      thumb?: string | null;
+      badge?: string | null;
+    };
+  };
+  language: AppLocale;
+}) {
+  const localizedName = getLocalizedName(item.names, item.name, language);
+
+  if (shouldUseBlueprintPreview(item)) {
+    return (
+      <div className="item-thumb item-thumb-blueprint">
+        <div className="item-thumb-blueprint-core" />
+        {item.assets?.badge && (
+          <img
+            className="item-thumb-blueprint-badge"
+            src={item.assets.badge}
+            alt=""
+            aria-hidden="true"
+          />
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="item-thumb">
+      {item.assets?.thumb ? (
+        <img
+          className="item-thumb-image"
+          src={item.assets.thumb}
+          alt={localizedName}
+        />
+      ) : (
+        <div className="item-thumb-fallback" />
+      )}
+      {item.assets?.badge && (
+        <img
+          className="item-thumb-badge"
           src={item.assets.badge}
           alt=""
           aria-hidden="true"
@@ -757,14 +842,17 @@ export default function App() {
                           return (
                             <tr key={row.slug}>
                               <td>
-                                <div className="item-name-cell">
-                                  <strong>
-                                    {getLocalizedName(row.names, row.name, language)}
-                                  </strong>
-                                  <span>{row.slug}</span>
-                                  {row.error && (
-                                    <span className="inline-error">{row.error}</span>
-                                  )}
+                                <div className="item-name-row">
+                                  <ItemTablePreview item={row} language={language} />
+                                  <div className="item-name-cell">
+                                    <strong>
+                                      {getLocalizedName(row.names, row.name, language)}
+                                    </strong>
+                                    <span>{row.slug}</span>
+                                    {row.error && (
+                                      <span className="inline-error">{row.error}</span>
+                                    )}
+                                  </div>
                                 </div>
                               </td>
                               <td>{row.quantity}</td>

@@ -580,6 +580,75 @@ button {
   min-width: 220px;
 }
 
+.item-name-row {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+}
+
+.item-thumb {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  border: 1px solid #253142;
+  border-radius: 12px;
+  background:
+    radial-gradient(circle at top, rgba(255, 255, 255, 0.06), transparent 52%),
+    #0f141c;
+  overflow: hidden;
+}
+
+.item-thumb-blueprint {
+  background:
+    radial-gradient(circle at top, rgba(242, 161, 74, 0.12), transparent 48%),
+    linear-gradient(180deg, rgba(19, 28, 39, 0.98), rgba(10, 15, 22, 0.98));
+}
+
+.item-thumb-image {
+  width: 76%;
+  height: 76%;
+  object-fit: contain;
+}
+
+.item-thumb-fallback,
+.item-thumb-blueprint-core {
+  width: 52%;
+  height: 52%;
+  border-radius: 10px;
+}
+
+.item-thumb-fallback {
+  background:
+    linear-gradient(135deg, rgba(242, 161, 74, 0.2), rgba(73, 138, 255, 0.16)),
+    #141b25;
+}
+
+.item-thumb-blueprint-core {
+  background:
+    linear-gradient(135deg, rgba(242, 161, 74, 0.22), rgba(104, 131, 255, 0.18)),
+    rgba(255, 255, 255, 0.04);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 8px 18px rgba(0, 0, 0, 0.24);
+}
+
+.item-thumb-badge,
+.item-thumb-blueprint-badge {
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  width: 14px;
+  height: 14px;
+  object-fit: contain;
+}
+
+.item-thumb-badge {
+  opacity: 0.92;
+}
+
 .item-name-cell strong {
   font-size: 0.96rem;
   overflow-wrap: break-word;
@@ -589,10 +658,18 @@ button {
   overflow-wrap: anywhere;
 }
 
+.inventory-table th:last-child,
+.inventory-table td:last-child {
+  width: 1%;
+  padding-right: 0;
+  white-space: nowrap;
+}
+
 .row-actions {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 8px;
+  justify-content: flex-end;
 }
 
 .ghost-button,
@@ -625,8 +702,8 @@ button {
 }
 
 .icon-button svg {
-  width: 17px;
-  height: 17px;
+  width: 18px;
+  height: 18px;
 }
 
 .icon-button.is-spinning svg {
