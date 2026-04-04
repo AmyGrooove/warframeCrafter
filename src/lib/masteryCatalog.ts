@@ -6,7 +6,7 @@ const MASTERY_IMAGE_BASE = "https://cdn.warframestat.us/img";
 const MASTERY_ITEMS_API_BASE = "https://api.warframestat.us/items";
 const MASTERY_TRANSLATIONS_URL = `${MASTERY_ITEMS_API_BASE}?language=ru`;
 const MASTERY_LIVE_DATA_URL = `${MASTERY_ITEMS_API_BASE}?language=en`;
-const MASTERY_CACHE_KEY = "wf-prime-tracker:mastery-catalog:v4";
+const MASTERY_CACHE_KEY = "wf-prime-tracker:mastery-catalog:v5";
 const DAY_IN_MS = 24 * 60 * 60 * 1000;
 
 const MASTERY_SOURCE_FILES = [
@@ -305,11 +305,16 @@ function normalizeTranslationMap(payload: unknown) {
   return namesByUniqueName;
 }
 
+function sanitizeMasteryName(value: string) {
+  return value.replace(/<\s*ARCHWING\s*>/gi, "").replace(/\s{2,}/g, " ").trim();
+}
+
 function toLocalizedNames(name: string, uniqueName: string | null, russianNames: Map<string, string>) {
-  const names: LocalizedNames = { en: name };
+  const names: LocalizedNames = { en: sanitizeMasteryName(name) };
 
   if (uniqueName && russianNames.has(uniqueName)) {
-    names.ru = russianNames.get(uniqueName) ?? undefined;
+    const localizedName = russianNames.get(uniqueName);
+    names.ru = localizedName ? sanitizeMasteryName(localizedName) : undefined;
   }
 
   return names;
@@ -342,10 +347,11 @@ function normalizeMasteryItem(
     return null;
   }
 
-  const name = toOptionalString(candidate.name);
+  const rawName = toOptionalString(candidate.name);
   const uniqueName = toOptionalString(candidate.uniqueName);
   const imageName = toOptionalString(candidate.imageName);
   const wikiaThumbnail = toOptionalString(candidate.wikiaThumbnail);
+  const name = rawName ? sanitizeMasteryName(rawName) : null;
 
   if (!name) {
     return null;
@@ -375,12 +381,13 @@ function normalizeLiveMasteryItem(
   }
 
   const candidate = record as Record<string, unknown>;
-  const name = toOptionalString(candidate.name);
+  const rawName = toOptionalString(candidate.name);
   const uniqueName = toOptionalString(candidate.uniqueName);
   const group = getLiveMasteryGroup(candidate);
   const typeLabel = toOptionalString(candidate.type);
   const masteryReq = toOptionalNumber(candidate.masteryReq) ?? toOptionalNumber(candidate.mr) ?? 0;
   const masterable = candidate.masterable === true;
+  const name = rawName ? sanitizeMasteryName(rawName) : null;
 
   if (!name || !group || looksLikeComponent(name, typeLabel)) {
     return null;
@@ -484,13 +491,13 @@ async function fetchLiveMasteryItems(russianNames: Map<string, string>) {
     .filter((entry): entry is MasteryItem => entry !== null);
 }
 
-export async function fetchMasteryCatalog(): Promise<MasteryItem[]> {
+export async function fetchMasteryCatalog(forceRefresh = false): Promise<MasteryItem[]> {
   const cached = loadFromStorage<CachedValue<MasteryItem[]> | null>(
     MASTERY_CACHE_KEY,
     null,
   );
 
-  if (cached && isFresh(cached.savedAt, DAY_IN_MS) && cached.value.length > 0) {
+  if (!forceRefresh && cached && isFresh(cached.savedAt, DAY_IN_MS) && cached.value.length > 0) {
     return cached.value;
   }
 

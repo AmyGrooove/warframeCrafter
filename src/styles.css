@@ -432,6 +432,12 @@ button {
   gap: 12px;
 }
 
+.section-heading-actions {
+  display: grid;
+  gap: 10px;
+  justify-items: flex-end;
+}
+
 .table-note {
   max-width: 360px;
   text-align: right;
@@ -685,6 +691,14 @@ button {
   min-height: 0;
 }
 
+.mastery-card-title {
+  display: -webkit-box;
+  min-height: calc(1.3em * 2);
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
 .mastery-card-footer {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
@@ -696,6 +710,7 @@ button {
 .mastery-wiki-button {
   min-width: 0;
   width: 100%;
+  grid-column: 1;
   justify-content: center;
   gap: 8px;
 }
@@ -708,6 +723,7 @@ button {
 .mastery-toggle {
   min-width: 0;
   width: 100%;
+  grid-column: 2;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1215,6 +1231,15 @@ button {
 
   .mastery-card-footer {
     grid-template-columns: 1fr;
+  }
+
+  .section-heading-actions {
+    justify-items: stretch;
+  }
+
+  .mastery-wiki-button,
+  .mastery-toggle {
+    grid-column: 1;
   }
 
   .table-note {

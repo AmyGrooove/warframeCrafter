@@ -46,6 +46,7 @@ const SECTION_RENDER_CHUNK_SIZE = 48;
 type AppSection = "inventory" | "pricing" | "ducats" | "mastery" | "settings";
 type MasteryStatusFilter = "all" | "pending" | "mastered";
 type MasteryPrimeFilter = "all" | "prime" | "nonPrime";
+type MasteryGroupFilterId = "all" | MasteryGroupId;
 type PricingMasteryFilter = "all" | "mastered" | "unmastered";
 type PricingSortKey =
   | "quantity"
@@ -109,6 +110,11 @@ const MASTERY_GROUPS: Array<{
   { id: "other", label: "Прочее" },
 ];
 
+const MASTERY_GROUP_FILTERS: Array<{
+  id: MasteryGroupFilterId;
+  label: string;
+}> = [{ id: "all", label: "Всё" }, ...MASTERY_GROUPS];
+
 const MASTERY_STATUS_FILTERS: Array<{
   id: MasteryStatusFilter;
   label: string;
@@ -161,6 +167,11 @@ interface MasteryImportEntry {
 interface ImportFeedback {
   tone: "success" | "error";
   message: string;
+}
+
+interface MasteryCatalogEntry {
+  item: MasteryItem;
+  sourceIds: string[];
 }
 
 function InventorySectionIcon() {
@@ -551,8 +562,8 @@ function getMarketItemUrl(slug: string) {
   return `https://warframe.market/items/${slug}`;
 }
 
-function getMasteryGroupLabel(group: MasteryGroupId) {
-  return MASTERY_GROUPS.find((entry) => entry.id === group)?.label ?? group;
+function getMasteryGroupLabel(group: MasteryGroupFilterId) {
+  return MASTERY_GROUP_FILTERS.find((entry) => entry.id === group)?.label ?? group;
 }
 
 function formatPlatinum(value: number | null) {
@@ -707,16 +718,93 @@ function buildMarketItemLookup(items: MarketItem[]) {
   return lookup;
 }
 
-function buildMasteryItemLookup(items: MasteryItem[]) {
-  const lookup = new Map<string, MasteryItem>();
+function groupMasteryCatalogEntries(items: MasteryItem[]) {
+  const entries = new Map<string, MasteryCatalogEntry>();
 
   for (const item of items) {
-    addLookupNameEntry(lookup, item.name, item);
-    addLookupNameEntry(lookup, item.names.en, item);
-    addLookupNameEntry(lookup, item.names.ru, item);
+    const key = getExactMasteryNameKey(item);
+    const current = entries.get(key);
+
+    if (!current) {
+      entries.set(key, {
+        item,
+        sourceIds: [item.id],
+      });
+      continue;
+    }
+
+    current.item = mergeMasteryCatalogItems(current.item, item);
+
+    if (!current.sourceIds.includes(item.id)) {
+      current.sourceIds.push(item.id);
+    }
+  }
+
+  return [...entries.values()];
+}
+
+function buildMasteryEntryLookup(entries: MasteryCatalogEntry[]) {
+  const lookup = new Map<string, MasteryCatalogEntry>();
+
+  for (const entry of entries) {
+    addLookupNameEntry(lookup, entry.item.name, entry);
+    addLookupNameEntry(lookup, entry.item.names.en, entry);
+    addLookupNameEntry(lookup, entry.item.names.ru, entry);
   }
 
   return lookup;
+}
+
+function getExactMasteryNameKey(item: Pick<MasteryItem, "name">) {
+  return item.name.trim().toLowerCase();
+}
+
+function mergeMasteryCatalogItems(existing: MasteryItem, next: MasteryItem): MasteryItem {
+  return {
+    ...existing,
+    names: {
+      ...next.names,
+      ...existing.names,
+    },
+    description: existing.description ?? next.description,
+    masteryReq: Math.max(existing.masteryReq, next.masteryReq),
+    group: existing.group === "other" && next.group !== "other" ? next.group : existing.group,
+    sourceCategory: existing.sourceCategory || next.sourceCategory,
+    typeLabel: existing.typeLabel || next.typeLabel,
+    imageUrl: existing.imageUrl ?? next.imageUrl,
+    fallbackImageUrl: existing.fallbackImageUrl ?? next.fallbackImageUrl,
+    wikiUrl: existing.wikiUrl ?? next.wikiUrl,
+  };
+}
+
+function isMasteryEntryMastered(
+  entry: Pick<MasteryCatalogEntry, "sourceIds">,
+  progress: Record<string, boolean>,
+) {
+  return entry.sourceIds.some((itemId) => !!progress[itemId]);
+}
+
+function buildExportFileName(prefix: string) {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `${prefix}-${timestamp}.json`;
+}
+
+function downloadJsonFile(prefix: string, payload: unknown) {
+  const blob = new Blob([JSON.stringify(payload, null, 2)], {
+    type: "application/json;charset=utf-8",
+  });
+  const url = window.URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = url;
+  link.download = buildExportFileName(prefix);
+  document.body.append(link);
+  link.click();
+  link.remove();
+
+  window.setTimeout(() => {
+    window.URL.revokeObjectURL(url);
+  }, 0);
 }
 
 function compareNullableNumbers(
@@ -881,6 +969,50 @@ function MasteryItemPreview({
   );
 }
 
+function MasteryCardTitle({ title }: { title: string }) {
+  const titleRef = useRef<HTMLElement | null>(null);
+  const [isTruncated, setIsTruncated] = useState(false);
+
+  useEffect(() => {
+    const element = titleRef.current;
+
+    if (!element) {
+      return;
+    }
+
+    const measureOverflow = () => {
+      setIsTruncated(element.scrollHeight > element.clientHeight + 1);
+    };
+
+    measureOverflow();
+
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", measureOverflow);
+
+      return () => {
+        window.removeEventListener("resize", measureOverflow);
+      };
+    }
+
+    const resizeObserver = new ResizeObserver(measureOverflow);
+    resizeObserver.observe(element);
+
+    return () => {
+      resizeObserver.disconnect();
+    };
+  }, [title]);
+
+  return (
+    <strong
+      ref={titleRef}
+      className="item-card-title mastery-card-title"
+      title={isTruncated ? title : undefined}
+    >
+      {title}
+    </strong>
+  );
+}
+
 function ItemTablePreview({
   item,
   language,
@@ -1011,7 +1143,7 @@ export default function App() {
     null,
   );
   const [masterySearch, setMasterySearch] = useState("");
-  const [masteryGroup, setMasteryGroup] = useState<MasteryGroupId>("warframes");
+  const [masteryGroup, setMasteryGroup] = useState<MasteryGroupFilterId>("all");
   const [masteryStatusFilter, setMasteryStatusFilter] =
     useState<MasteryStatusFilter>("pending");
   const [masteryPrimeFilter, setMasteryPrimeFilter] =
@@ -1038,9 +1170,9 @@ export default function App() {
   const [inventoryMasteryFilter, setInventoryMasteryFilter] =
     useState<PricingMasteryFilter>("all");
   const [pricingMasteryFilter, setPricingMasteryFilter] =
-    useState<PricingMasteryFilter>("unmastered");
+    useState<PricingMasteryFilter>("mastered");
   const [ducatsMasteryFilter, setDucatsMasteryFilter] =
-    useState<PricingMasteryFilter>("unmastered");
+    useState<PricingMasteryFilter>("mastered");
   const [pricingSort, setPricingSort] = useState<{
     key: PricingSortKey;
     direction: "asc" | "desc";
@@ -1069,12 +1201,12 @@ export default function App() {
   );
   const catalogImportLookup = useMemo(() => buildMarketItemLookup(catalog), [catalog]);
   const masteryImportLookup = useMemo(
-    () => buildMasteryItemLookup(masteryCatalog),
+    () => buildMasteryEntryLookup(groupMasteryCatalogEntries(masteryCatalog)),
     [masteryCatalog],
   );
 
-  async function ensureMasteryCatalogLoaded() {
-    if (masteryCatalogState === "ready" && masteryCatalog.length > 0) {
+  async function ensureMasteryCatalogLoaded(forceRefresh = false) {
+    if (!forceRefresh && masteryCatalogState === "ready" && masteryCatalog.length > 0) {
       return masteryCatalog;
     }
 
@@ -1085,7 +1217,7 @@ export default function App() {
     const request = (async () => {
       try {
         setMasteryCatalogState("loading");
-        const items = await fetchMasteryCatalog();
+        const items = await fetchMasteryCatalog(forceRefresh);
 
         setMasteryCatalog(items);
         setMasteryCatalogState("ready");
@@ -1552,12 +1684,17 @@ export default function App() {
   const activeSectionMeta =
     APP_SECTIONS.find((section) => section.id === activeSection) ?? APP_SECTIONS[0];
 
+  const masteryCatalogEntries = useMemo(
+    () => groupMasteryCatalogEntries(masteryCatalog),
+    [masteryCatalog],
+  );
+
   const masteryTotals = useMemo(() => {
-    const mastered = masteryCatalog.reduce(
-      (count, item) => count + (masteryProgress[item.id] ? 1 : 0),
+    const mastered = masteryCatalogEntries.reduce(
+      (count, entry) => count + (isMasteryEntryMastered(entry, masteryProgress) ? 1 : 0),
       0,
     );
-    const total = masteryCatalog.length;
+    const total = masteryCatalogEntries.length;
 
     return {
       total,
@@ -1565,33 +1702,34 @@ export default function App() {
       remaining: Math.max(total - mastered, 0),
       completionRate: total > 0 ? mastered / total : 0,
     };
-  }, [masteryCatalog, masteryProgress]);
+  }, [masteryCatalogEntries, masteryProgress]);
 
   const masteryGroupStats = useMemo(() => {
     const stats = Object.fromEntries(
       MASTERY_GROUPS.map((group) => [group.id, { total: 0, mastered: 0 }]),
     ) as Record<MasteryGroupId, { total: number; mastered: number }>;
 
-    for (const item of masteryCatalog) {
+    for (const entry of masteryCatalogEntries) {
+      const { item } = entry;
       stats[item.group].total += 1;
 
-      if (masteryProgress[item.id]) {
+      if (isMasteryEntryMastered(entry, masteryProgress)) {
         stats[item.group].mastered += 1;
       }
     }
 
     return stats;
-  }, [masteryCatalog, masteryProgress]);
+  }, [masteryCatalogEntries, masteryProgress]);
 
   const pricingMasteryLookup = useMemo(() => {
-    return masteryCatalog
-      .filter((item) => isPrimeMasteryItem(item))
-      .map((item) => ({
-        id: item.id,
+    return masteryCatalogEntries
+      .filter(({ item }) => isPrimeMasteryItem(item))
+      .map(({ item, sourceIds }) => ({
+        sourceIds,
         normalizedName: normalizeLookupText(item.name),
       }))
       .sort((left, right) => right.normalizedName.length - left.normalizedName.length);
-  }, [masteryCatalog]);
+  }, [masteryCatalogEntries]);
 
   const rowsWithMastery = useMemo(() => {
     return rows.map((row) => {
@@ -1601,7 +1739,9 @@ export default function App() {
           normalizedRowName === item.normalizedName ||
           normalizedRowName.startsWith(`${item.normalizedName} `),
       );
-      const masteryStatus = masteryMatch ? !!masteryProgress[masteryMatch.id] : null;
+      const masteryStatus = masteryMatch
+        ? masteryMatch.sourceIds.some((itemId) => !!masteryProgress[itemId])
+        : null;
 
       return {
         row,
@@ -1910,13 +2050,15 @@ export default function App() {
   ]);
 
   const filteredMasteryItems = useMemo(() => {
-    return masteryCatalog
-      .filter((item) => {
-        if (item.group !== masteryGroup) {
+    return masteryCatalogEntries
+      .filter((entry) => {
+        const { item } = entry;
+
+        if (masteryGroup !== "all" && item.group !== masteryGroup) {
           return false;
         }
 
-        const isMastered = !!masteryProgress[item.id];
+        const isMastered = isMasteryEntryMastered(entry, masteryProgress);
         const isPrime = isPrimeMasteryItem(item);
 
         if (masteryStatusFilter === "pending" && isMastered) {
@@ -1952,15 +2094,15 @@ export default function App() {
         return searchTarget.includes(deferredMasterySearch);
       })
       .sort((left, right) => {
-        const leftMastered = masteryProgress[left.id] ? 1 : 0;
-        const rightMastered = masteryProgress[right.id] ? 1 : 0;
+        const leftMastered = isMasteryEntryMastered(left, masteryProgress) ? 1 : 0;
+        const rightMastered = isMasteryEntryMastered(right, masteryProgress) ? 1 : 0;
 
         if (leftMastered !== rightMastered) {
           return leftMastered - rightMastered;
         }
 
-        return getLocalizedName(left.names, left.name, language).localeCompare(
-          getLocalizedName(right.names, right.name, language),
+        return getLocalizedName(left.item.names, left.item.name, language).localeCompare(
+          getLocalizedName(right.item.names, right.item.name, language),
           language,
           { numeric: true },
         );
@@ -1968,7 +2110,7 @@ export default function App() {
   }, [
     deferredMasterySearch,
     language,
-    masteryCatalog,
+    masteryCatalogEntries,
     masteryGroup,
     masteryPrimeFilter,
     masteryProgress,
@@ -2174,14 +2316,18 @@ export default function App() {
     changeQuantity(slug, target.quantity - 1);
   }
 
-  function toggleMastered(itemId: string) {
+  function toggleMastered(itemIds: string | string[]) {
     setMasteryProgress((current) => {
+      const targetIds = Array.isArray(itemIds) ? itemIds : [itemIds];
       const next = { ...current };
+      const isMarked = targetIds.some((itemId) => !!next[itemId]);
 
-      if (next[itemId]) {
-        delete next[itemId];
-      } else {
-        next[itemId] = true;
+      for (const itemId of targetIds) {
+        if (isMarked) {
+          delete next[itemId];
+        } else {
+          next[itemId] = true;
+        }
       }
 
       return next;
@@ -2318,20 +2464,22 @@ export default function App() {
       const lookup =
         masteryItems === masteryCatalog && masteryImportLookup.size > 0
           ? masteryImportLookup
-          : buildMasteryItemLookup(masteryItems);
+          : buildMasteryEntryLookup(groupMasteryCatalogEntries(masteryItems));
       const updates = new Map<string, boolean>();
       const missingNames: string[] = [];
 
       for (const entry of validEntries) {
         const normalizedName = normalizeImportName(entry.name);
-        const matchedItem = lookup.get(normalizedName);
+        const matchedEntry = lookup.get(normalizedName);
 
-        if (!normalizedName || !matchedItem) {
+        if (!normalizedName || !matchedEntry) {
           missingNames.push(entry.name);
           continue;
         }
 
-        updates.set(matchedItem.id, entry.isMastery);
+        for (const itemId of matchedEntry.sourceIds) {
+          updates.set(itemId, entry.isMastery);
+        }
       }
 
       if (updates.size === 0) {
@@ -2370,6 +2518,26 @@ export default function App() {
             : "Не удалось прочитать файл освоенных предметов.",
       });
     }
+  }
+
+  function handleInventoryExport() {
+    const payload = inventory.map((item) => ({
+      name: getLocalizedName(item.names, item.name, language),
+      count: item.quantity,
+    }));
+
+    downloadJsonFile("warframe-inventory", payload);
+  }
+
+  async function handleMasteryExport() {
+    const masteryItems =
+      masteryCatalogEntries.length > 0 ? masteryCatalogEntries : groupMasteryCatalogEntries(await ensureMasteryCatalogLoaded());
+    const payload = masteryItems.map((entry) => ({
+      name: getLocalizedName(entry.item.names, entry.item.name, language),
+      isMastery: isMasteryEntryMastered(entry, masteryProgress),
+    }));
+
+    downloadJsonFile("warframe-mastery-progress", payload);
   }
 
   function togglePricingSort(key: PricingSortKey) {
@@ -2451,8 +2619,8 @@ export default function App() {
     setErrors({});
     setIsBulkRefreshing(false);
     setInventoryMasteryFilter("all");
-    setPricingMasteryFilter("unmastered");
-    setDucatsMasteryFilter("unmastered");
+    setPricingMasteryFilter("mastered");
+    setDucatsMasteryFilter("mastered");
     setPricingSort(null);
     setDucatSort({
       key: "ducatsPerPlatinum",
@@ -2460,7 +2628,7 @@ export default function App() {
     });
     setMasteryProgress({});
     setMasterySearch("");
-    setMasteryGroup("warframes");
+    setMasteryGroup("all");
     setMasteryStatusFilter("pending");
     setMasteryPrimeFilter("all");
     setVisibleMasteryCount(SECTION_RENDER_CHUNK_SIZE);
@@ -3281,10 +3449,21 @@ export default function App() {
                       в браузере.
                     </p>
                   </div>
-                  <span className="table-note">
-                    Сейчас вкладка использует готовый каталог, поэтому названия
-                    предметов пока на английском.
-                  </span>
+                  <div className="section-heading-actions">
+                    <button
+                      className="ghost-button"
+                      type="button"
+                      onClick={() => void ensureMasteryCatalogLoaded(true)}
+                      disabled={masteryCatalogState === "loading"}
+                    >
+                      {masteryCatalogState === "loading"
+                        ? "Обновляю данные..."
+                        : "Обновить данные"}
+                    </button>
+                    <span className="table-note">
+                      Если в источнике появились новые предметы, обнови каталог вручную.
+                    </span>
+                  </div>
                 </div>
 
                 <div className="mastery-toolbar">
@@ -3324,8 +3503,9 @@ export default function App() {
                 </div>
 
                 <div className="filter-row" aria-label="Фильтр по категориям mastery">
-                  {MASTERY_GROUPS.map((group) => {
-                    const stats = masteryGroupStats[group.id];
+                  {MASTERY_GROUP_FILTERS.map((group) => {
+                    const stats =
+                      group.id === "all" ? masteryTotals : masteryGroupStats[group.id];
 
                     return (
                       <button
@@ -3375,8 +3555,10 @@ export default function App() {
                     </div>
 
                     <div className="item-grid mastery-grid">
-                      {visibleMasteryItems.map((item) => {
-                        const isMastered = !!masteryProgress[item.id];
+                      {visibleMasteryItems.map((entry) => {
+                        const { item, sourceIds } = entry;
+                        const isMastered = isMasteryEntryMastered(entry, masteryProgress);
+                        const localizedName = getLocalizedName(item.names, item.name, language);
 
                         return (
                           <article
@@ -3386,9 +3568,7 @@ export default function App() {
                             <MasteryItemPreview item={item} language={language} />
 
                             <div className="item-card-body mastery-card-body">
-                              <strong>
-                                {getLocalizedName(item.names, item.name, language)}
-                              </strong>
+                              <MasteryCardTitle title={localizedName} />
                             </div>
 
                             <div className="mastery-card-footer">
@@ -3407,7 +3587,7 @@ export default function App() {
                               <button
                                 className={`mastery-toggle${isMastered ? " is-active" : ""}`}
                                 type="button"
-                                onClick={() => toggleMastered(item.id)}
+                                onClick={() => toggleMastered(sourceIds)}
                               >
                                 {isMastered ? "Освоено" : "Отметить"}
                               </button>
@@ -3485,8 +3665,8 @@ export default function App() {
                   <div className="settings-group-header">
                     <h2>Загрузка данных</h2>
                     <p>
-                      Импортируй сохранённые JSON-файлы, чтобы быстро восстановить
-                      инвентарь и прогресс освоения.
+                      Импортируй и экспортируй JSON-файлы, чтобы быстро сохранять
+                      и восстанавливать инвентарь и прогресс освоения.
                     </p>
                   </div>
 
@@ -3541,6 +3721,28 @@ export default function App() {
 
                     <article className="settings-item">
                       <div className="settings-copy">
+                        <strong>Экспорт инвентаря</strong>
+                        <p>
+                          Сохраняет текущий инвентарь в JSON-массиве формата{" "}
+                          <code>{`[{ "name": "", "count": 2 }]`}</code> для
+                          последующего импорта.
+                        </p>
+                      </div>
+
+                      <div className="settings-actions">
+                        <button
+                          className="ghost-button"
+                          type="button"
+                          onClick={handleInventoryExport}
+                          disabled={inventory.length === 0}
+                        >
+                          Экспорт JSON
+                        </button>
+                      </div>
+                    </article>
+
+                    <article className="settings-item">
+                      <div className="settings-copy">
                         <strong>Импорт освоенных предметов</strong>
                         <p>
                           Загружает JSON-массив в формате <code>{`[{ "name": "", "isMastery": true }]`}</code>.
@@ -3580,6 +3782,36 @@ export default function App() {
                           }}
                         >
                           Импорт JSON
+                        </button>
+                      </div>
+                    </article>
+
+                    <article className="settings-item">
+                      <div className="settings-copy">
+                        <strong>Экспорт освоенных предметов</strong>
+                        <p>
+                          Сохраняет текущий mastery-прогресс в JSON-массиве
+                          формата <code>{`[{ "name": "", "isMastery": true }]`}</code>,
+                          чтобы его можно было импортировать обратно.
+                        </p>
+                        {masteryCatalogState === "loading" && (
+                          <p className="settings-note">
+                            Загружаю mastery-каталог для подготовки экспорта...
+                          </p>
+                        )}
+                        {masteryCatalogState === "error" && masteryCatalogError && (
+                          <p className="settings-note">{masteryCatalogError}</p>
+                        )}
+                      </div>
+
+                      <div className="settings-actions">
+                        <button
+                          className="ghost-button"
+                          type="button"
+                          onClick={() => void handleMasteryExport()}
+                          disabled={masteryCatalogState === "loading"}
+                        >
+                          Экспорт JSON
                         </button>
                       </div>
                     </article>
