@@ -591,9 +591,21 @@ function formatDucats(value: number | null) {
     return "—";
   }
 
-  return new Intl.NumberFormat("ru-RU", {
-    maximumFractionDigits: 0,
-  }).format(value);
+  return (
+    <span className="price-value">
+      <span>
+        {new Intl.NumberFormat("ru-RU", {
+          maximumFractionDigits: 0,
+        }).format(value)}
+      </span>
+      <FadeInImage
+        className="ducat-icon"
+        src="/ducatIcon.webp"
+        alt=""
+        aria-hidden="true"
+      />
+    </span>
+  );
 }
 
 function formatDucatEfficiency(value: number | null) {
@@ -990,6 +1002,7 @@ export default function App() {
   const [loadingSlugs, setLoadingSlugs] = useState<Set<string>>(new Set());
   const [errors, setErrors] = useState<Record<string, string | null>>({});
   const [isBulkRefreshing, setIsBulkRefreshing] = useState(false);
+  const [queuedPriceJobCount, setQueuedPriceJobCount] = useState(0);
   const [masteryCatalog, setMasteryCatalog] = useState<MasteryItem[]>([]);
   const [masteryCatalogState, setMasteryCatalogState] = useState<
     "idle" | "loading" | "ready" | "error"
@@ -1205,6 +1218,10 @@ export default function App() {
     setVisibleDucatCount(SECTION_RENDER_CHUNK_SIZE);
   }, [ducatSort.direction, ducatSort.key, ducatsMasteryFilter]);
 
+  function syncQueuedPriceJobCount() {
+    setQueuedPriceJobCount(queuedPriceJobsRef.current.size);
+  }
+
   function cancelPriceJob(slug: string) {
     const job = queuedPriceJobsRef.current.get(slug);
 
@@ -1217,6 +1234,7 @@ export default function App() {
     queuedPriceSlugsRef.current = queuedPriceSlugsRef.current.filter(
       (queuedSlug) => queuedSlug !== slug,
     );
+    syncQueuedPriceJobCount();
 
     if (job.started && job.controller) {
       job.controller.abort();
@@ -1351,6 +1369,7 @@ export default function App() {
 
           if (currentJob === job) {
             queuedPriceJobsRef.current.delete(slug);
+            syncQueuedPriceJobCount();
           }
 
           if (isMountedRef.current) {
@@ -1432,6 +1451,7 @@ export default function App() {
       reject: rejectJob,
     });
     queuedPriceSlugsRef.current.push(item.slug);
+    syncQueuedPriceJobCount();
     processPriceQueue();
 
     return promise;
@@ -2449,8 +2469,16 @@ export default function App() {
     setVisibleDucatCount(SECTION_RENDER_CHUNK_SIZE);
   }
 
+  const isAnyPriceRefreshActive =
+    isBulkRefreshing || loadingSlugs.size > 0 || queuedPriceJobCount > 0;
+
   async function refreshAll(force = false) {
-    if (inventory.length === 0) {
+    if (
+      inventory.length === 0 ||
+      isBulkRefreshing ||
+      activePriceRequestsRef.current > 0 ||
+      queuedPriceJobsRef.current.size > 0
+    ) {
       return;
     }
 
@@ -2511,9 +2539,9 @@ export default function App() {
                   className="primary-button"
                   type="button"
                   onClick={() => void refreshAll(true)}
-                  disabled={isBulkRefreshing || inventory.length === 0}
+                  disabled={isAnyPriceRefreshActive || inventory.length === 0}
                 >
-                  {isBulkRefreshing ? "Обновляю цены..." : "Обновить все цены"}
+                  {isAnyPriceRefreshActive ? "Обновляю цены..." : "Обновить все цены"}
                 </button>
               )}
               {activeSection === "ducats" && (
@@ -2521,9 +2549,9 @@ export default function App() {
                   className="primary-button"
                   type="button"
                   onClick={() => void refreshAll(true)}
-                  disabled={isBulkRefreshing || inventory.length === 0}
+                  disabled={isAnyPriceRefreshActive || inventory.length === 0}
                 >
-                  {isBulkRefreshing ? "Обновляю цены..." : "Обновить все цены"}
+                  {isAnyPriceRefreshActive ? "Обновляю цены..." : "Обновить все цены"}
                 </button>
               )}
               {activeSection === "mastery" && masteryCatalogState === "ready" && (
@@ -2571,22 +2599,32 @@ export default function App() {
 
                 {suggestions.length > 0 && (
                   <div className="item-grid search-suggestions-grid">
-                    {suggestions.map((item) => (
-                      <button
-                        key={item.slug}
-                        className="item-card item-card-button"
-                        type="button"
-                        onClick={() => addItem(item)}
-                      >
-                        <ItemPreview item={item} language={language} />
-                        <div className="item-card-body">
-                          <strong>
-                            {getLocalizedName(item.names, item.name, language)}
-                          </strong>
-                          <span>{item.slug}</span>
-                        </div>
-                      </button>
-                    ))}
+                    {suggestions.map((item) => {
+                      const localizedName = getLocalizedName(
+                        item.names,
+                        item.name,
+                        language,
+                      );
+
+                      return (
+                        <button
+                          key={item.slug}
+                          className="item-card item-card-button"
+                          type="button"
+                          onClick={() => addItem(item)}
+                        >
+                          <ItemPreview item={item} language={language} />
+                          <div className="item-card-body item-card-body-fixed">
+                            <strong className="item-card-title" title={localizedName}>
+                              {localizedName}
+                            </strong>
+                            <span className="item-card-slug" title={item.slug}>
+                              {item.slug}
+                            </span>
+                          </div>
+                        </button>
+                      );
+                    })}
                   </div>
                 )}
               </section>
@@ -2657,47 +2695,57 @@ export default function App() {
                     </div>
 
                     <div className="item-grid owned-grid">
-                      {visibleInventoryRows.map(({ row }) => (
-                        <article key={row.slug} className="item-card owned-card">
-                          <ItemPreview item={row} language={language} />
+                      {visibleInventoryRows.map(({ row }) => {
+                        const localizedName = getLocalizedName(
+                          row.names,
+                          row.name,
+                          language,
+                        );
 
-                          <div className="item-card-body">
-                            <strong>
-                              {getLocalizedName(row.names, row.name, language)}
-                            </strong>
-                            <span>{row.slug}</span>
-                          </div>
+                        return (
+                          <article key={row.slug} className="item-card owned-card">
+                            <ItemPreview item={row} language={language} />
 
-                          <div className="owned-card-footer">
-                            <div className="owned-card-meta">
-                              <label className="card-quantity" aria-label="Количество предметов">
-                                <input
-                                  className="quantity-input"
-                                  type="number"
-                                  min={1}
-                                  step={1}
-                                  value={row.quantity}
-                                  onChange={(event) =>
-                                    changeQuantity(
-                                      row.slug,
-                                      Number.parseInt(event.target.value, 10),
-                                    )
-                                  }
-                                />
-                              </label>
-                              <button
-                                className="danger-button icon-button inventory-delete-button"
-                                type="button"
-                                onClick={() => removeItem(row.slug)}
-                                aria-label="Удалить предмет"
-                                title="Удалить предмет"
-                              >
-                                <TrashIcon />
-                              </button>
+                            <div className="item-card-body item-card-body-fixed">
+                              <strong className="item-card-title" title={localizedName}>
+                                {localizedName}
+                              </strong>
+                              <span className="item-card-slug" title={row.slug}>
+                                {row.slug}
+                              </span>
                             </div>
-                          </div>
-                        </article>
-                      ))}
+
+                            <div className="owned-card-footer">
+                              <div className="owned-card-meta">
+                                <label className="card-quantity" aria-label="Количество предметов">
+                                  <input
+                                    className="quantity-input"
+                                    type="number"
+                                    min={1}
+                                    step={1}
+                                    value={row.quantity}
+                                    onChange={(event) =>
+                                      changeQuantity(
+                                        row.slug,
+                                        Number.parseInt(event.target.value, 10),
+                                      )
+                                    }
+                                  />
+                                </label>
+                                <button
+                                  className="danger-button icon-button inventory-delete-button"
+                                  type="button"
+                                  onClick={() => removeItem(row.slug)}
+                                  aria-label="Удалить предмет"
+                                  title="Удалить предмет"
+                                >
+                                  <TrashIcon />
+                                </button>
+                              </div>
+                            </div>
+                          </article>
+                        );
+                      })}
                     </div>
 
                     {hasMoreInventoryRows && (

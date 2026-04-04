@@ -352,8 +352,16 @@ button {
 }
 
 .platinum-icon {
-  width: 0.85rem;
-  height: 0.85rem;
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  object-fit: contain;
+  transform: translateY(1px);
+}
+
+.ducat-icon {
+  width: 20px;
+  height: 20px;
   flex: 0 0 auto;
   object-fit: contain;
   transform: translateY(1px);
@@ -622,7 +630,33 @@ button {
 }
 
 .owned-card {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  align-content: stretch;
+  height: 100%;
+}
+
+.item-card-body-fixed {
+  grid-template-rows: minmax(calc(0.94rem * 1.3 * 2), auto) minmax(0.96rem, auto);
   align-content: start;
+}
+
+.item-card-title {
+  display: -webkit-box;
+  min-height: calc(1.3em * 2);
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.item-card-slug {
+  display: block;
+  min-width: 0;
+  line-height: 1.2;
+  min-height: 1.2em;
+  overflow-wrap: normal;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .mastery-card {
