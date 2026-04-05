@@ -6,6 +6,7 @@ import {
   useState,
   type ChangeEvent,
   type ComponentPropsWithoutRef,
+  type FormEvent,
 } from "react";
 import { fetchMasteryCatalog } from "./lib/masteryCatalog";
 import {
@@ -15,6 +16,12 @@ import {
   loadCachedPriceSnapshots,
   PriceFetchError,
 } from "./lib/warframeMarket";
+import {
+  fetchWikiPageData,
+  normalizeWikiPageTitle,
+  type WikiCraftingIngredient,
+  type WikiPageData,
+} from "./lib/warframeWiki";
 import {
   loadFromStorage,
   removeFromStorageByPrefix,
@@ -28,14 +35,20 @@ import type {
   MasteryGroupId,
   MasteryItem,
   MarketItem,
+  MarketAssets,
   PriceRequestMeta,
   PriceSnapshot,
 } from "./types";
 
 const INVENTORY_KEY = "wf-prime-tracker:inventory:v1";
 const LANGUAGE_KEY = "wf-prime-tracker:language:v1";
+const MARKET_USERNAME_KEY = "wf-prime-tracker:market-username:v1";
 const MASTERY_PROGRESS_KEY = "wf-prime-tracker:mastery-progress:v1";
 const PRICE_REQUEST_META_KEY = "wf-prime-tracker:price-request-meta:v1";
+const SALE_MARKS_KEY = "wf-prime-tracker:sale-marks:v1";
+const SOLD_HISTORY_KEY = "wf-prime-tracker:sold-history:v1";
+const WIKI_PAGE_CACHE_KEY = "wf-prime-tracker:wiki-page-cache:v4";
+const WIKI_PAGE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const APP_STORAGE_PREFIX = "wf-prime-tracker:";
 const PRICE_QUEUE_CONCURRENCY = 2;
 const PRICE_QUEUE_DELAY_MS = 180;
@@ -43,11 +56,19 @@ const PRICE_GENERAL_RETRY_MS = 60 * 1000;
 const PRICE_ERROR_COOLDOWN_MS = 7 * 60 * 1000;
 const SECTION_RENDER_CHUNK_SIZE = 48;
 
-type AppSection = "inventory" | "pricing" | "ducats" | "mastery" | "settings";
+type AppSection =
+  | "inventory"
+  | "statistics"
+  | "pricing"
+  | "ducats"
+  | "mastery"
+  | "settings";
 type MasteryStatusFilter = "all" | "pending" | "mastered";
 type MasteryPrimeFilter = "all" | "prime" | "nonPrime";
 type MasteryGroupFilterId = "all" | MasteryGroupId;
 type PricingMasteryFilter = "all" | "mastered" | "unmastered";
+type SaleRecordType = "item" | "set";
+type SaleRecordSource = "auto" | "manual";
 type PricingSortKey =
   | "quantity"
   | "minSellPrice"
@@ -66,6 +87,7 @@ const APP_SECTIONS: Array<{
   id: AppSection;
   label: string;
   description: string;
+  disabled?: boolean;
 }> = [
   {
     id: "inventory",
@@ -73,9 +95,15 @@ const APP_SECTIONS: Array<{
     description: "Добавление предметов и управление личным списком.",
   },
   {
+    id: "statistics",
+    label: "Статистика",
+    description: "История всех проданных вещей и ручные записи продаж.",
+    disabled: true,
+  },
+  {
     id: "pricing",
     label: "Стоимость",
-    description: "Таблица цен по твоим прайм-предметам.",
+    description: "Таблица цен по прайм-предметам и комплектам.",
   },
   {
     id: "ducats",
@@ -142,6 +170,67 @@ const PRICING_MASTERY_FILTERS: Array<{
   { id: "unmastered", label: "Не освоено" },
 ];
 
+const SALE_HISTORY_TYPE_FILTERS: Array<{
+  id: SaleRecordType | "all";
+  label: string;
+}> = [
+  { id: "all", label: "Все" },
+  { id: "item", label: "Предметы" },
+  { id: "set", label: "Комплекты" },
+];
+
+const INVENTORY_ENTITY_COMPONENT_SUFFIXES = [
+  "blueprint",
+  "chassis",
+  "neuroptics",
+  "systems",
+  "harness",
+  "cerebrum",
+  "carapace",
+  "barrel",
+  "receiver",
+  "stock",
+  "blade",
+  "handle",
+  "disc",
+  "ornament",
+  "string",
+  "grip",
+  "link",
+  "loader",
+  "gauntlet",
+  "hilt",
+  "pouch",
+  "head",
+  "tail",
+  "casing",
+  "core",
+  "engine",
+  "rotor",
+  "pod",
+  "brace",
+  "chamber",
+  "prism",
+  "scaffold",
+  "certus",
+  "clapkra",
+  "lohrin",
+  "pencha",
+  "phahd",
+  "klebrik",
+  "shwaak",
+  "rahn",
+  "lega",
+  "cantic",
+  "propa",
+  "sirocco",
+] as const;
+
+interface MasteryLookupEntry {
+  sourceIds: string[];
+  normalizedName: string;
+}
+
 interface PriceQueueJob {
   item: Pick<InventoryItem, "slug" | "name">;
   force: boolean;
@@ -152,6 +241,23 @@ interface PriceQueueJob {
   promise: Promise<PriceSnapshot | null>;
   resolve: (snapshot: PriceSnapshot | null) => void;
   reject: (error: Error) => void;
+}
+
+interface SaleMarksState {
+  itemSlugs: string[];
+  setSlugs: string[];
+  itemSalePrices: Record<string, number | null>;
+  setSalePrices: Record<string, number | null>;
+}
+
+interface SoldRecord {
+  id: string;
+  soldAt: string;
+  type: SaleRecordType;
+  source: SaleRecordSource;
+  quantity: number;
+  unitPrice: number | null;
+  item: Pick<InventoryItem, "slug" | "name" | "names" | "assets">;
 }
 
 interface InventoryImportEntry {
@@ -172,6 +278,52 @@ interface ImportFeedback {
 interface MasteryCatalogEntry {
   item: MasteryItem;
   sourceIds: string[];
+}
+
+interface WikiPageCacheEntry {
+  savedAt: number;
+  data: WikiPageData | null;
+}
+
+type WikiPageCache = Record<string, WikiPageCacheEntry>;
+
+interface AssemblableSetDefinition {
+  entityName: string;
+  setItem: MarketItem;
+  requiredPartSlugs: string[];
+}
+
+interface InventoryDisplayEntry {
+  row: InventoryRow;
+  masteryStatus: boolean | null;
+  total: number | null;
+  isAssemblableSet?: boolean;
+  isMissingSet?: boolean;
+  collectedPartCount?: number;
+  requiredPartCount?: number;
+  missingPartCount?: number;
+  recipeSummary?: string;
+  missingSummary?: string;
+  recipeIngredients?: WikiCraftingIngredient[];
+  searchText?: string;
+}
+
+interface WikiSetRowBuildOptions {
+  rows: InventoryRow[];
+  catalog: MarketItem[];
+  catalogDisplayLookup: Map<string, MarketItem>;
+  wikiPageCache: WikiPageCache;
+  priceMap: Record<string, PriceSnapshot>;
+  loadingSlugs: Set<string>;
+  errors: Record<string, string | null>;
+  pricingMasteryLookup: MasteryLookupEntry[];
+  masteryProgress: Record<string, boolean>;
+  language: AppLocale;
+}
+
+interface WikiSetRowBuildResult {
+  craftableRows: InventoryDisplayEntry[];
+  missingRows: InventoryDisplayEntry[];
 }
 
 function InventorySectionIcon() {
@@ -220,6 +372,47 @@ function InventorySectionIcon() {
         rx="0.8"
         fill="currentColor"
       />
+    </svg>
+  );
+}
+
+function StatisticsSectionIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none">
+      <path
+        d="M5.25 18.75h13.5"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+      />
+      <path
+        d="M7.25 16.2v-4.1"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+      />
+      <path
+        d="M12 16.2V8.8"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+      />
+      <path
+        d="M16.75 16.2v-6.3"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+      />
+      <path
+        d="M7.25 12.1 12 8.8l4.75 1.9"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <circle cx="7.25" cy="12.1" r="0.95" fill="currentColor" />
+      <circle cx="12" cy="8.8" r="0.95" fill="currentColor" />
+      <circle cx="16.75" cy="10.7" r="0.95" fill="currentColor" />
     </svg>
   );
 }
@@ -411,35 +604,16 @@ function SoldIcon() {
   );
 }
 
-function TrashIcon() {
+function SaleIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none">
       <path
-        d="M5.75 7.25h12.5"
+        d="M5.75 10.2V6.75A1.75 1.75 0 0 1 7.5 5h3.45l7.25 7.25a1.75 1.75 0 0 1 0 2.47l-3 3a1.75 1.75 0 0 1-2.47 0L5.75 10.2Z"
         stroke="currentColor"
         strokeWidth="1.8"
-        strokeLinecap="round"
-      />
-      <path
-        d="M9.35 7.25V6.1a1.35 1.35 0 0 1 1.35-1.35h2.6a1.35 1.35 0 0 1 1.35 1.35v1.15"
-        stroke="currentColor"
-        strokeWidth="1.8"
-        strokeLinecap="round"
         strokeLinejoin="round"
       />
-      <path
-        d="M8.1 9.6v6.8a2 2 0 0 0 2 2h3.8a2 2 0 0 0 2-2V9.6"
-        stroke="currentColor"
-        strokeWidth="1.8"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-      <path
-        d="M10.6 11.2v4.4M13.4 11.2v4.4"
-        stroke="currentColor"
-        strokeWidth="1.8"
-        strokeLinecap="round"
-      />
+      <circle cx="9.2" cy="8.85" r="1.05" fill="currentColor" />
     </svg>
   );
 }
@@ -507,6 +681,10 @@ function SectionIcon({ section }: { section: AppSection }) {
     return <InventorySectionIcon />;
   }
 
+  if (section === "statistics") {
+    return <StatisticsSectionIcon />;
+  }
+
   if (section === "pricing") {
     return <PricingSectionIcon />;
   }
@@ -520,6 +698,60 @@ function SectionIcon({ section }: { section: AppSection }) {
   }
 
   return <SettingsSectionIcon />;
+}
+
+function RefreshProgressBar({
+  label,
+  completed,
+  total,
+  remaining,
+  active,
+}: {
+  label: string;
+  completed: number;
+  total: number;
+  remaining: number;
+  active: number;
+}) {
+  if (total <= 0) {
+    return null;
+  }
+
+  const percent = Math.round((completed / total) * 100);
+  const statusText =
+    active > 0
+      ? `В работе ${active}`
+      : remaining > 0
+        ? `Осталось обновить ${remaining}`
+        : "Все обновлено";
+
+  return (
+    <div className={`refresh-progress${active > 0 ? " is-active" : ""}`}>
+      <div className="refresh-progress-head">
+        <span>{label}</span>
+        <strong>
+          {completed} / {total}
+        </strong>
+      </div>
+      <div
+        className="refresh-progress-track"
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={total}
+        aria-valuenow={completed}
+        aria-valuetext={`${completed} из ${total} обновлено, осталось ${remaining}`}
+      >
+        <span
+          className="refresh-progress-fill"
+          style={{ width: `${percent}%` }}
+        />
+      </div>
+      <div className="refresh-progress-meta">
+        <span>{statusText}</span>
+        <span>{remaining > 0 ? `Не обновлено ${remaining}` : "Сводка актуальна"}</span>
+      </div>
+    </div>
+  );
 }
 
 function FadeInImage({
@@ -655,6 +887,366 @@ function normalizeImportName(value: string) {
     .trim();
 }
 
+function isPrimeSetName(value: string | undefined) {
+  return typeof value === "string" && /\s+set$/i.test(value.trim());
+}
+
+function trimTrailingWord(value: string, word: string) {
+  const trimmedValue = value.trim();
+
+  if (!trimmedValue) {
+    return "";
+  }
+
+  const standalonePattern = new RegExp(`^${word}$`, "i");
+
+  if (standalonePattern.test(trimmedValue)) {
+    return "";
+  }
+
+  const trailingPattern = new RegExp(`\\s+${word}$`, "i");
+  return trimmedValue.replace(trailingPattern, "").trim();
+}
+
+function getPrimeEntityName(value: string) {
+  let current = value.trim();
+  let didChange = true;
+
+  while (didChange && current.length > 0) {
+    didChange = false;
+
+    const withoutSet = trimTrailingWord(current, "set");
+
+    if (withoutSet !== current) {
+      current = withoutSet;
+      didChange = true;
+      continue;
+    }
+
+    for (const suffix of INVENTORY_ENTITY_COMPONENT_SUFFIXES) {
+      const stripped = trimTrailingWord(current, suffix);
+
+      if (stripped !== current) {
+        current = stripped;
+        didChange = true;
+        break;
+      }
+    }
+  }
+
+  return current;
+}
+
+function sanitizeStoredInventory(items: InventoryItem[]) {
+  return items.filter((item) => !isPrimeSetName(item.name));
+}
+
+function normalizeSaleMarksState(value: Partial<SaleMarksState> | null | undefined) {
+  const itemSlugs = Array.isArray(value?.itemSlugs)
+    ? value.itemSlugs.filter((slug): slug is string => typeof slug === "string")
+    : [];
+  const setSlugs = Array.isArray(value?.setSlugs)
+    ? value.setSlugs.filter((slug): slug is string => typeof slug === "string")
+    : [];
+  const itemSlugSet = new Set(itemSlugs);
+  const setSlugSet = new Set(setSlugs);
+  const itemSalePrices = filterRecordByKeys(
+    normalizeSalePriceMap(value?.itemSalePrices),
+    itemSlugSet,
+  );
+  const setSalePrices = filterRecordByKeys(
+    normalizeSalePriceMap(value?.setSalePrices),
+    setSlugSet,
+  );
+
+  return {
+    itemSlugs: [...new Set(itemSlugs)].sort(),
+    setSlugs: [...new Set(setSlugs)].sort(),
+    itemSalePrices,
+    setSalePrices,
+  };
+}
+
+function createSaleRecordId() {
+  return `sale-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function buildManualSaleSlug(name: string, type: SaleRecordType) {
+  const normalizedName = normalizeImportName(name)
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9а-яё-]/gi, "");
+
+  return `manual-${type}-${normalizedName || "entry"}`;
+}
+
+function normalizeStoredLocalizedNames(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const candidate = value as Record<string, unknown>;
+  const result: Partial<LocalizedNames> = {};
+
+  if (typeof candidate.en === "string" && candidate.en.trim().length > 0) {
+    result.en = candidate.en.trim();
+  }
+
+  if (typeof candidate.ru === "string" && candidate.ru.trim().length > 0) {
+    result.ru = candidate.ru.trim();
+  }
+
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+function normalizeStoredMarketAssets(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const candidate = value as Record<string, unknown>;
+  const result: Partial<MarketAssets> = {};
+
+  for (const key of ["thumb", "icon", "badge"] as const) {
+    const raw = candidate[key];
+
+    if (typeof raw === "string" && raw.trim().length > 0) {
+      result[key] = raw.trim();
+    }
+  }
+
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+function normalizeSoldHistory(value: unknown) {
+  if (!Array.isArray(value)) {
+    return [] as SoldRecord[];
+  }
+
+  const result: SoldRecord[] = [];
+
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      continue;
+    }
+
+    const candidate = entry as Record<string, unknown>;
+    const itemCandidate = candidate.item;
+
+    if (!itemCandidate || typeof itemCandidate !== "object" || Array.isArray(itemCandidate)) {
+      continue;
+    }
+
+    const item = itemCandidate as Record<string, unknown>;
+    const name =
+      typeof item.name === "string" && item.name.trim().length > 0
+        ? item.name.trim()
+        : typeof item.slug === "string" && item.slug.trim().length > 0
+          ? item.slug.trim()
+          : "";
+
+    if (!name) {
+      continue;
+    }
+
+    const rawType = candidate.type;
+    const type: SaleRecordType = rawType === "set" ? "set" : "item";
+    const slug =
+      typeof item.slug === "string" && item.slug.trim().length > 0
+        ? item.slug.trim()
+        : buildManualSaleSlug(name, type);
+    const quantity = Math.max(
+      1,
+      Math.floor(
+        typeof candidate.quantity === "number" && Number.isFinite(candidate.quantity)
+          ? candidate.quantity
+          : 1,
+      ),
+    );
+    const unitPrice =
+      candidate.unitPrice === null
+        ? null
+        : typeof candidate.unitPrice === "number" && Number.isFinite(candidate.unitPrice)
+          ? Math.max(0, Math.round(candidate.unitPrice))
+          : null;
+    const soldAt =
+      typeof candidate.soldAt === "string" && !Number.isNaN(Date.parse(candidate.soldAt))
+        ? candidate.soldAt
+        : new Date().toISOString();
+    const source: SaleRecordSource = candidate.source === "auto" ? "auto" : "manual";
+    const names = normalizeStoredLocalizedNames(item.names);
+    const assets = normalizeStoredMarketAssets(item.assets);
+
+    result.push({
+      id:
+        typeof candidate.id === "string" && candidate.id.trim().length > 0
+          ? candidate.id.trim()
+          : createSaleRecordId(),
+      soldAt,
+      type,
+      source,
+      quantity,
+      unitPrice,
+      item: {
+        slug,
+        name,
+        ...(names ? { names } : {}),
+        ...(assets ? { assets } : {}),
+      },
+    });
+  }
+
+  return result.sort(
+    (left, right) =>
+      new Date(right.soldAt).getTime() - new Date(left.soldAt).getTime(),
+  );
+}
+
+function matchesSoldHistorySearch(record: SoldRecord, normalizedSearch: string) {
+  if (!normalizedSearch) {
+    return true;
+  }
+
+  const targets = [
+    record.item.slug,
+    record.item.name,
+    record.item.names?.en,
+    record.item.names?.ru,
+    record.source,
+    record.type,
+    formatSaleRecordTypeLabel(record.type),
+    formatSaleRecordSourceLabel(record.source),
+  ].filter((value): value is string => typeof value === "string" && value.length > 0);
+
+  return targets.some((value) =>
+    normalizeImportName(value).includes(normalizedSearch),
+  );
+}
+
+function formatSaleRecordTypeLabel(type: SaleRecordType) {
+  return type === "set" ? "Комплект" : "Предмет";
+}
+
+function formatSaleRecordSourceLabel(source: SaleRecordSource) {
+  return source === "auto" ? "Авто" : "Ручная";
+}
+
+function normalizeSalePriceMap(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {} as Record<string, number | null>;
+  }
+
+  const result: Record<string, number | null> = {};
+
+  for (const [slug, price] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof slug !== "string") {
+      continue;
+    }
+
+    if (price === null) {
+      result[slug] = null;
+      continue;
+    }
+
+    if (typeof price === "number" && Number.isFinite(price)) {
+      result[slug] = price;
+    }
+  }
+
+  return Object.fromEntries(
+    Object.entries(result).sort(([left], [right]) => left.localeCompare(right)),
+  ) as Record<string, number | null>;
+}
+
+function filterRecordByKeys<T>(
+  record: Record<string, T>,
+  allowedKeys: Set<string>,
+) {
+  let didChange = false;
+  const nextEntries: Array<[string, T]> = [];
+
+  for (const [key, value] of Object.entries(record)) {
+    if (!allowedKeys.has(key)) {
+      didChange = true;
+      continue;
+    }
+
+    nextEntries.push([key, value as T]);
+  }
+
+  if (!didChange) {
+    return record;
+  }
+
+  return Object.fromEntries(nextEntries) as Record<string, T>;
+}
+
+function setRecordValue<T>(
+  record: Record<string, T>,
+  key: string,
+  value: T,
+) {
+  if (Object.prototype.hasOwnProperty.call(record, key) && record[key] === value) {
+    return record;
+  }
+
+  return {
+    ...record,
+    [key]: value,
+  };
+}
+
+function removeRecordValue<T>(record: Record<string, T>, key: string) {
+  if (!Object.prototype.hasOwnProperty.call(record, key)) {
+    return record;
+  }
+
+  const next = { ...record };
+  delete next[key];
+
+  return next;
+}
+
+function toggleSlugInList(slugs: string[], slug: string) {
+  const next = new Set(slugs);
+
+  if (next.has(slug)) {
+    next.delete(slug);
+  } else {
+    next.add(slug);
+  }
+
+  return [...next].sort();
+}
+
+function removeSlugFromList(slugs: string[], slug: string) {
+  const filtered = slugs.filter((currentSlug) => currentSlug !== slug);
+
+  return filtered.length === slugs.length ? slugs : filtered;
+}
+
+function matchesInventorySearch(
+  row: Pick<InventoryRow, "name" | "slug" | "names"> & {
+    searchText?: string;
+  },
+  normalizedSearch: string,
+) {
+  if (!normalizedSearch) {
+    return true;
+  }
+
+  const targets = [row.name, row.slug, row.names?.en, row.names?.ru].filter(
+    (value): value is string => typeof value === "string" && value.length > 0,
+  );
+
+  if (row.searchText) {
+    targets.push(row.searchText);
+  }
+
+  return targets.some((value) =>
+    normalizeImportName(value).includes(normalizedSearch),
+  );
+}
+
 function addLookupNameEntry<T>(lookup: Map<string, T>, rawName: string | undefined, value: T) {
   if (!rawName) {
     return;
@@ -710,12 +1302,426 @@ function buildMarketItemLookup(items: MarketItem[]) {
   const lookup = new Map<string, MarketItem>();
 
   for (const item of items) {
+    if (isPrimeSetName(item.name)) {
+      continue;
+    }
+
     addLookupNameEntry(lookup, item.name, item);
     addLookupNameEntry(lookup, item.names.en, item);
     addLookupNameEntry(lookup, item.names.ru, item);
   }
 
   return lookup;
+}
+
+function buildCatalogItemLookup(items: MarketItem[]) {
+  const lookup = new Map<string, MarketItem>();
+
+  for (const item of items) {
+    addLookupNameEntry(lookup, item.name, item);
+    addLookupNameEntry(lookup, item.names.en, item);
+    addLookupNameEntry(lookup, item.names.ru, item);
+  }
+
+  return lookup;
+}
+
+function getCatalogItemLookupCandidates(value: string) {
+  const normalized = normalizeImportName(value);
+
+  if (!normalized) {
+    return [];
+  }
+
+  return [
+    normalized,
+    normalized.replace(/\s+/g, " "),
+  ];
+}
+
+function resolveCatalogItemLike(
+  items: MarketItem[],
+  exactLookup: Map<string, MarketItem>,
+  value: string,
+  options?: { includeSets?: boolean },
+) {
+  const candidates = getCatalogItemLookupCandidates(value);
+
+  for (const candidate of candidates) {
+    const exact = exactLookup.get(candidate);
+
+    if (exact && (options?.includeSets !== false || !isPrimeSetName(exact.name))) {
+      return exact;
+    }
+  }
+
+  const normalizedQuery = normalizeImportName(value);
+
+  if (!normalizedQuery) {
+    return null;
+  }
+
+  const normalizedQueryTerms = normalizedQuery.split(" ").filter(Boolean);
+  let bestItem: MarketItem | null = null;
+  let bestScore = 0;
+
+  for (const item of items) {
+    if (options?.includeSets === false && isPrimeSetName(item.name)) {
+      continue;
+    }
+
+    const itemCandidates = [item.name, item.names.en, item.names.ru].filter(
+      (candidate): candidate is string => typeof candidate === "string" && candidate.length > 0,
+    );
+
+    for (const candidate of itemCandidates) {
+      const normalizedCandidate = normalizeImportName(candidate);
+
+      if (!normalizedCandidate) {
+        continue;
+      }
+
+      if (normalizedCandidate === normalizedQuery) {
+        return item;
+      }
+
+      let score = 0;
+
+      if (normalizedCandidate.startsWith(normalizedQuery)) {
+        score = Math.max(score, 100 - (normalizedCandidate.length - normalizedQuery.length));
+      }
+
+      if (normalizedQuery.startsWith(normalizedCandidate)) {
+        score = Math.max(score, 90 - (normalizedQuery.length - normalizedCandidate.length));
+      }
+
+      const queryMatchCount = normalizedQueryTerms.filter((term) =>
+        normalizedCandidate.includes(term),
+      ).length;
+
+      if (queryMatchCount > 0) {
+        score = Math.max(score, queryMatchCount * 10);
+      }
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestItem = item;
+      }
+    }
+  }
+
+  return bestScore > 0 ? bestItem : null;
+}
+
+function buildAssemblableSetDefinitions(catalog: MarketItem[]) {
+  const entries = new Map<
+    string,
+    {
+      setItem: MarketItem | null;
+      requiredPartSlugs: Set<string>;
+    }
+  >();
+
+  for (const item of catalog) {
+    const entityName = getPrimeEntityName(item.name);
+
+    if (!entityName) {
+      continue;
+    }
+
+    const current = entries.get(entityName) ?? {
+      setItem: null,
+      requiredPartSlugs: new Set<string>(),
+    };
+
+    if (isPrimeSetName(item.name)) {
+      current.setItem = item;
+    } else {
+      current.requiredPartSlugs.add(item.slug);
+    }
+
+    entries.set(entityName, current);
+  }
+
+  const result: AssemblableSetDefinition[] = [];
+
+  for (const [entityName, entry] of entries) {
+    if (!entry.setItem || entry.requiredPartSlugs.size === 0) {
+      continue;
+    }
+
+    result.push({
+      entityName,
+      setItem: entry.setItem,
+      requiredPartSlugs: [...entry.requiredPartSlugs],
+    });
+  }
+
+  return result;
+}
+
+function resolveMasteryStatus(
+  name: string,
+  lookup: MasteryLookupEntry[],
+  progress: Record<string, boolean>,
+) {
+  const normalizedRowName = normalizeLookupText(name);
+  const masteryMatch = lookup.find(
+    (item) =>
+      normalizedRowName === item.normalizedName ||
+      normalizedRowName.startsWith(`${item.normalizedName} `),
+  );
+
+  return masteryMatch
+    ? masteryMatch.sourceIds.some((itemId) => !!progress[itemId])
+    : null;
+}
+
+function createInventoryDisplayEntry(
+  row: InventoryRow,
+  lookup: MasteryLookupEntry[],
+  progress: Record<string, boolean>,
+  metadata: Pick<
+    InventoryDisplayEntry,
+    | "isAssemblableSet"
+    | "isMissingSet"
+    | "collectedPartCount"
+    | "requiredPartCount"
+    | "missingPartCount"
+    | "recipeSummary"
+    | "missingSummary"
+    | "recipeIngredients"
+    | "searchText"
+  > = {},
+): InventoryDisplayEntry {
+  return {
+    ...metadata,
+    row,
+    masteryStatus: resolveMasteryStatus(row.name, lookup, progress),
+    total:
+      row.price?.minSellPrice !== null && row.price
+        ? row.price.minSellPrice * row.quantity
+        : null,
+  };
+}
+
+function isWikiPageCacheFresh(entry: WikiPageCacheEntry) {
+  if (!Number.isFinite(entry.savedAt)) {
+    return false;
+  }
+
+  return Date.now() - entry.savedAt < WIKI_PAGE_CACHE_TTL_MS;
+}
+
+function summarizeWikiIngredients(
+  ingredients: WikiCraftingIngredient[],
+  catalogBySlug: Map<string, MarketItem>,
+  language: AppLocale,
+) {
+  return ingredients
+    .map((ingredient) => {
+      const catalogItem = catalogBySlug.get(ingredient.slug);
+      const displayName = catalogItem
+        ? getLocalizedName(catalogItem.names, catalogItem.name, language)
+        : ingredient.name;
+
+      return `${displayName} ×${ingredient.quantity}`;
+    })
+    .join(", ");
+}
+
+function aggregateWikiCraftingIngredients(ingredients: WikiCraftingIngredient[]) {
+  const requirements = new Map<string, WikiCraftingIngredient>();
+
+  for (const ingredient of ingredients) {
+    const current = requirements.get(ingredient.slug);
+
+    if (current) {
+      current.quantity += ingredient.quantity;
+      continue;
+    }
+
+    requirements.set(ingredient.slug, { ...ingredient });
+  }
+
+  return [...requirements.values()];
+}
+
+function summarizeMissingWikiIngredients(
+  ingredients: WikiCraftingIngredient[],
+  catalogBySlug: Map<string, MarketItem>,
+  language: AppLocale,
+) {
+  return ingredients
+    .map((ingredient) => {
+      const catalogItem = catalogBySlug.get(ingredient.slug);
+      const displayName = catalogItem
+        ? getLocalizedName(catalogItem.names, catalogItem.name, language)
+        : ingredient.name;
+
+      return `${displayName} ×${ingredient.quantity}`;
+    })
+    .join(", ");
+}
+
+function buildWikiSetRows(options: WikiSetRowBuildOptions): WikiSetRowBuildResult {
+  const inventoryQuantities = new Map(
+    options.rows.map((row) => [row.slug, row.quantity] as const),
+  );
+  const catalogBySlug = new Map(
+    options.catalog.map((item) => [item.slug, item] as const),
+  );
+  const craftableRows: InventoryDisplayEntry[] = [];
+  const missingRows: InventoryDisplayEntry[] = [];
+  const seenSetSlugs = new Set<string>();
+
+  for (const { data } of Object.values(options.wikiPageCache)) {
+    if (!data) {
+      continue;
+    }
+
+    const finalItem =
+      resolveCatalogItemLike(
+        options.catalog,
+        options.catalogDisplayLookup,
+        `${data.title} Set`,
+      ) ?? resolveCatalogItemLike(options.catalog, options.catalogDisplayLookup, data.title);
+
+    if (!finalItem) {
+      continue;
+    }
+
+    if (seenSetSlugs.has(finalItem.slug)) {
+      continue;
+    }
+
+    const requirements = aggregateWikiCraftingIngredients(data.ingredients);
+
+    if (requirements.length === 0) {
+      seenSetSlugs.add(finalItem.slug);
+      continue;
+    }
+
+    let craftableCount = Number.POSITIVE_INFINITY;
+    let requiredQuantity = 0;
+    let collectedQuantity = 0;
+    const missingIngredients: WikiCraftingIngredient[] = [];
+
+    for (const ingredient of requirements) {
+      requiredQuantity += ingredient.quantity;
+
+      const ownedQuantity = inventoryQuantities.get(ingredient.slug) ?? 0;
+      craftableCount = Math.min(
+        craftableCount,
+        Math.floor(ownedQuantity / ingredient.quantity),
+      );
+      collectedQuantity += Math.min(ownedQuantity, ingredient.quantity);
+
+      const missingQuantity = Math.max(ingredient.quantity - ownedQuantity, 0);
+
+      if (missingQuantity > 0) {
+        missingIngredients.push({
+          slug: ingredient.slug,
+          name: ingredient.name,
+          quantity: missingQuantity,
+        });
+      }
+    }
+
+    if (requiredQuantity < 2) {
+      seenSetSlugs.add(finalItem.slug);
+      continue;
+    }
+
+    const price = options.priceMap[finalItem.slug] ?? null;
+    const baseRow = {
+      slug: finalItem.slug,
+      name: finalItem.name,
+      names: finalItem.names,
+      assets: finalItem.assets,
+      ducats: finalItem.ducats,
+      quantity: Math.max(0, Math.floor(craftableCount)),
+      price,
+      status: options.loadingSlugs.has(finalItem.slug)
+        ? "loading"
+        : options.errors[finalItem.slug]
+          ? "error"
+          : price
+            ? "ready"
+            : "idle",
+      error: options.errors[finalItem.slug] ?? null,
+    } satisfies InventoryRow;
+    const recipeSummary = summarizeWikiIngredients(
+      requirements,
+      catalogBySlug,
+      options.language,
+    );
+
+    if (craftableCount >= 1) {
+      craftableRows.push(
+        createInventoryDisplayEntry(
+          baseRow,
+          options.pricingMasteryLookup,
+          options.masteryProgress,
+          {
+            isAssemblableSet: true,
+            collectedPartCount: collectedQuantity,
+            requiredPartCount: requiredQuantity,
+            recipeSummary,
+            recipeIngredients: requirements,
+            searchText: recipeSummary,
+          },
+        ),
+      );
+    } else if (missingIngredients.length > 0) {
+      const missingSummary = summarizeMissingWikiIngredients(
+        missingIngredients,
+        catalogBySlug,
+        options.language,
+      );
+
+      missingRows.push(
+        createInventoryDisplayEntry(
+          baseRow,
+          options.pricingMasteryLookup,
+          options.masteryProgress,
+          {
+            isMissingSet: true,
+            collectedPartCount: collectedQuantity,
+            requiredPartCount: requiredQuantity,
+            missingPartCount: requiredQuantity - collectedQuantity,
+            recipeSummary,
+            missingSummary,
+            recipeIngredients: requirements,
+            searchText: `${recipeSummary} ${missingSummary}`,
+          },
+        ),
+      );
+    }
+
+    seenSetSlugs.add(finalItem.slug);
+  }
+
+  const sortByName = (left: InventoryDisplayEntry, right: InventoryDisplayEntry) =>
+    getLocalizedName(left.row.names, left.row.name, options.language).localeCompare(
+      getLocalizedName(right.row.names, right.row.name, options.language),
+      options.language,
+    );
+  const sortMissingByCount = (left: InventoryDisplayEntry, right: InventoryDisplayEntry) => {
+    const leftMissing = left.missingPartCount ?? Number.POSITIVE_INFINITY;
+    const rightMissing = right.missingPartCount ?? Number.POSITIVE_INFINITY;
+
+    if (leftMissing !== rightMissing) {
+      return leftMissing - rightMissing;
+    }
+
+    return sortByName(left, right);
+  };
+
+  return {
+    craftableRows: craftableRows.sort(sortByName),
+    missingRows: missingRows.sort(sortMissingByCount),
+  };
 }
 
 function groupMasteryCatalogEntries(items: MasteryItem[]) {
@@ -827,10 +1833,6 @@ function compareNullableNumbers(
   return direction === "asc" ? left - right : right - left;
 }
 
-function createAbortError() {
-  return new DOMException("Запрос отменен", "AbortError");
-}
-
 function isAbortError(error: unknown) {
   return error instanceof DOMException && error.name === "AbortError";
 }
@@ -862,14 +1864,96 @@ function getLocalizedName(
   return names[language] ?? names.en ?? fallback;
 }
 
-function shouldUseBlueprintPreview(item: {
-  slug: string;
+const BLUEPRINT_DISPLAY_SUFFIX_PATTERNS = [
+  /\s*\((?:черт[её]ж|blueprint)\)$/i,
+  /\s+(?:черт[её]ж|blueprint)$/i,
+];
+
+const BLUEPRINT_DISPLAY_SUFFIX_LABELS: Record<AppLocale, string> = {
+  ru: "Чертеж",
+  en: "Blueprint",
+};
+
+function stripBlueprintSuffix(value: string) {
+  let current = value.trim();
+  let didChange = true;
+
+  while (didChange && current.length > 0) {
+    didChange = false;
+
+    for (const pattern of BLUEPRINT_DISPLAY_SUFFIX_PATTERNS) {
+      const next = current.replace(pattern, "").trim();
+
+      if (next !== current) {
+        current = next;
+        didChange = true;
+        break;
+      }
+    }
+  }
+
+  return current || value.trim();
+}
+
+function hasBlueprintSuffix(value: string) {
+  const trimmed = value.trim();
+
+  return BLUEPRINT_DISPLAY_SUFFIX_PATTERNS.some((pattern) => pattern.test(trimmed));
+}
+
+function getDisplayName(
+  names: Partial<LocalizedNames> | undefined,
+  fallback: string,
+  language: AppLocale,
+) {
+  const localizedName = getLocalizedName(names, fallback, language);
+  const displayName = stripBlueprintSuffix(localizedName);
+
+  if (!hasBlueprintSuffix(localizedName) || displayName.includes(":")) {
+    return displayName;
+  }
+
+  return `${displayName}: ${BLUEPRINT_DISPLAY_SUFFIX_LABELS[language]}`;
+}
+
+const ITEM_PREVIEW_PLACEHOLDER_IMAGE_PATTERN =
+  /(?:question(?:[-_ ]?mark)?|unidentified(?:item)?|unknown|placeholder|missing)/i;
+
+function isPlaceholderPreviewImage(url: string | null | undefined) {
+  if (!url) {
+    return false;
+  }
+
+  try {
+    return ITEM_PREVIEW_PLACEHOLDER_IMAGE_PATTERN.test(new URL(url).pathname);
+  } catch {
+    return ITEM_PREVIEW_PLACEHOLDER_IMAGE_PATTERN.test(url);
+  }
+}
+
+function getPreviewImageSources(item: {
   assets?: {
-    badge?: string | null;
     thumb?: string | null;
+    badge?: string | null;
+    icon?: string | null;
   };
 }) {
-  return item.slug.endsWith("_blueprint") && !!item.assets?.badge;
+  const thumb = item.assets?.thumb ?? null;
+  const badge = item.assets?.badge ?? null;
+  const icon = item.assets?.icon ?? null;
+  const preferredCandidates = isPlaceholderPreviewImage(thumb)
+    ? [badge, icon, thumb]
+    : [thumb, badge, icon];
+
+  const candidates = preferredCandidates
+    .filter((value): value is string => typeof value === "string" && value.length > 0)
+    .filter((value, index, values) => values.indexOf(value) === index);
+
+  const nonPlaceholderCandidates = candidates.filter(
+    (candidate) => !isPlaceholderPreviewImage(candidate),
+  );
+
+  return nonPlaceholderCandidates.length > 0 ? nonPlaceholderCandidates : candidates;
 }
 
 function ItemPreview({
@@ -882,41 +1966,50 @@ function ItemPreview({
     names?: Partial<LocalizedNames>;
     assets?: {
       thumb?: string | null;
+      icon?: string | null;
       badge?: string | null;
     };
   };
   language: AppLocale;
 }) {
-  const localizedName = getLocalizedName(item.names, item.name, language);
+  const displayName = getDisplayName(item.names, item.name, language);
+  const previewImageSources = useMemo(
+    () => getPreviewImageSources(item),
+    [item.assets?.badge, item.assets?.icon, item.assets?.thumb],
+  );
+  const [currentImageUrl, setCurrentImageUrl] = useState<string | null>(
+    previewImageSources[0] ?? null,
+  );
+  const shouldShowBadge = !!item.assets?.badge && currentImageUrl !== item.assets.badge;
 
-  if (shouldUseBlueprintPreview(item)) {
-    return (
-      <div className="item-card-media blueprint-media">
-        <div className="blueprint-core" />
-        {item.assets?.badge && (
-          <FadeInImage
-            className="blueprint-badge"
-            src={item.assets.badge}
-            alt=""
-            aria-hidden="true"
-          />
-        )}
-      </div>
-    );
-  }
+  useEffect(() => {
+    setCurrentImageUrl(previewImageSources[0] ?? null);
+  }, [item.slug, previewImageSources]);
 
   return (
     <div className="item-card-media">
-      {item.assets?.thumb ? (
+      {currentImageUrl ? (
         <FadeInImage
           className="item-card-image"
-          src={item.assets.thumb}
-          alt={localizedName}
+          src={currentImageUrl}
+          alt={displayName}
+          loading="lazy"
+          onError={() => {
+            const currentIndex = previewImageSources.indexOf(currentImageUrl);
+            const nextImageUrl = previewImageSources[currentIndex + 1] ?? null;
+
+            if (nextImageUrl) {
+              setCurrentImageUrl(nextImageUrl);
+              return;
+            }
+
+            setCurrentImageUrl(null);
+          }}
         />
       ) : (
         <div className="item-card-fallback" />
       )}
-      {item.assets?.badge && (
+      {shouldShowBadge && item.assets?.badge && (
         <FadeInImage
           className="item-card-badge"
           src={item.assets.badge}
@@ -938,7 +2031,7 @@ function MasteryItemPreview({
   const [currentImageUrl, setCurrentImageUrl] = useState<string | null>(
     item.imageUrl ?? item.fallbackImageUrl,
   );
-  const localizedName = getLocalizedName(item.names, item.name, language);
+  const displayName = getDisplayName(item.names, item.name, language);
 
   useEffect(() => {
     setCurrentImageUrl(item.imageUrl ?? item.fallbackImageUrl);
@@ -950,7 +2043,7 @@ function MasteryItemPreview({
         <FadeInImage
           className="item-card-image mastery-card-image"
           src={currentImageUrl}
-          alt={localizedName}
+          alt={displayName}
           loading="lazy"
           referrerPolicy="no-referrer"
           onError={() => {
@@ -1023,41 +2116,50 @@ function ItemTablePreview({
     names?: Partial<LocalizedNames>;
     assets?: {
       thumb?: string | null;
+      icon?: string | null;
       badge?: string | null;
     };
   };
   language: AppLocale;
 }) {
-  const localizedName = getLocalizedName(item.names, item.name, language);
+  const displayName = getDisplayName(item.names, item.name, language);
+  const previewImageSources = useMemo(
+    () => getPreviewImageSources(item),
+    [item.assets?.badge, item.assets?.icon, item.assets?.thumb],
+  );
+  const [currentImageUrl, setCurrentImageUrl] = useState<string | null>(
+    previewImageSources[0] ?? null,
+  );
+  const shouldShowBadge = !!item.assets?.badge && currentImageUrl !== item.assets.badge;
 
-  if (shouldUseBlueprintPreview(item)) {
-    return (
-      <div className="item-thumb item-thumb-blueprint">
-        <div className="item-thumb-blueprint-core" />
-        {item.assets?.badge && (
-          <FadeInImage
-            className="item-thumb-blueprint-badge"
-            src={item.assets.badge}
-            alt=""
-            aria-hidden="true"
-          />
-        )}
-      </div>
-    );
-  }
+  useEffect(() => {
+    setCurrentImageUrl(previewImageSources[0] ?? null);
+  }, [item.slug, previewImageSources]);
 
   return (
     <div className="item-thumb">
-      {item.assets?.thumb ? (
+      {currentImageUrl ? (
         <FadeInImage
           className="item-thumb-image"
-          src={item.assets.thumb}
-          alt={localizedName}
+          src={currentImageUrl}
+          alt={displayName}
+          loading="lazy"
+          onError={() => {
+            const currentIndex = previewImageSources.indexOf(currentImageUrl);
+            const nextImageUrl = previewImageSources[currentIndex + 1] ?? null;
+
+            if (nextImageUrl) {
+              setCurrentImageUrl(nextImageUrl);
+              return;
+            }
+
+            setCurrentImageUrl(null);
+          }}
         />
       ) : (
         <div className="item-thumb-fallback" />
       )}
-      {item.assets?.badge && (
+      {shouldShowBadge && item.assets?.badge && (
         <FadeInImage
           className="item-thumb-badge"
           src={item.assets.badge}
@@ -1117,14 +2219,32 @@ export default function App() {
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [inventory, setInventory] = useState<InventoryItem[]>(() =>
-    loadFromStorage<InventoryItem[]>(INVENTORY_KEY, []),
+    sanitizeStoredInventory(loadFromStorage<InventoryItem[]>(INVENTORY_KEY, [])),
   );
+  const [saleMarks, setSaleMarks] = useState<SaleMarksState>(() =>
+    normalizeSaleMarksState(loadFromStorage<Partial<SaleMarksState>>(SALE_MARKS_KEY, {})),
+  );
+  const [soldHistory, setSoldHistory] = useState<SoldRecord[]>(() =>
+    normalizeSoldHistory(loadFromStorage<unknown>(SOLD_HISTORY_KEY, [])),
+  );
+  const [wikiPageCache, setWikiPageCache] = useState<WikiPageCache>(() =>
+    loadFromStorage<WikiPageCache>(WIKI_PAGE_CACHE_KEY, {}),
+  );
+  const [wikiPageState, setWikiPageState] = useState<
+    "idle" | "loading" | "ready" | "error"
+  >("idle");
+  const [wikiPageError, setWikiPageError] = useState<string | null>(null);
+  const [inventorySearch, setInventorySearch] = useState("");
   const [language, setLanguage] = useState<AppLocale>(() =>
     loadFromStorage<AppLocale>(LANGUAGE_KEY, "ru"),
   );
   const [activeSection, setActiveSection] = useState<AppSection>("inventory");
+  const [marketUsername, setMarketUsername] = useState(() =>
+    loadFromStorage<string>(MARKET_USERNAME_KEY, ""),
+  );
+  const [marketUsernameInput, setMarketUsernameInput] = useState(marketUsername);
   const [priceMap, setPriceMap] = useState<Record<string, PriceSnapshot>>(() =>
-    loadCachedPriceSnapshots(),
+    loadCachedPriceSnapshots(marketUsername),
   );
   const [priceRequestMetaMap, setPriceRequestMetaMap] = useState<
     Record<string, PriceRequestMeta>
@@ -1135,6 +2255,8 @@ export default function App() {
   const [errors, setErrors] = useState<Record<string, string | null>>({});
   const [isBulkRefreshing, setIsBulkRefreshing] = useState(false);
   const [queuedPriceJobCount, setQueuedPriceJobCount] = useState(0);
+  const [isAutoPriceRefreshPaused, setIsAutoPriceRefreshPaused] = useState(false);
+  const [isRefreshAllButtonHovered, setIsRefreshAllButtonHovered] = useState(false);
   const [masteryCatalog, setMasteryCatalog] = useState<MasteryItem[]>([]);
   const [masteryCatalogState, setMasteryCatalogState] = useState<
     "idle" | "loading" | "ready" | "error"
@@ -1152,6 +2274,8 @@ export default function App() {
     useState<ImportFeedback | null>(null);
   const [masteryImportFeedback, setMasteryImportFeedback] =
     useState<ImportFeedback | null>(null);
+  const [saleHistoryFeedback, setSaleHistoryFeedback] =
+    useState<ImportFeedback | null>(null);
   const [masteryProgress, setMasteryProgress] = useState<Record<string, boolean>>(
     () => loadFromStorage<Record<string, boolean>>(MASTERY_PROGRESS_KEY, {}),
   );
@@ -1167,12 +2291,29 @@ export default function App() {
   const [visibleDucatCount, setVisibleDucatCount] = useState(
     SECTION_RENDER_CHUNK_SIZE,
   );
+  const [inventoryShowAssemblableSetsOnly, setInventoryShowAssemblableSetsOnly] =
+    useState(false);
+  const [
+    inventoryShowMissingSetRequirementsOnly,
+    setInventoryShowMissingSetRequirementsOnly,
+  ] = useState(false);
+  const [pricingShowAssemblableSetsOnly, setPricingShowAssemblableSetsOnly] =
+    useState(false);
+  const [pricingSearch, setPricingSearch] = useState("");
+  const [pricingShowOnSaleOnly, setPricingShowOnSaleOnly] = useState(false);
   const [inventoryMasteryFilter, setInventoryMasteryFilter] =
     useState<PricingMasteryFilter>("all");
   const [pricingMasteryFilter, setPricingMasteryFilter] =
     useState<PricingMasteryFilter>("mastered");
   const [ducatsMasteryFilter, setDucatsMasteryFilter] =
     useState<PricingMasteryFilter>("mastered");
+  const [saleHistorySearch, setSaleHistorySearch] = useState("");
+  const [saleHistoryTypeFilter, setSaleHistoryTypeFilter] =
+    useState<SaleRecordType | "all">("all");
+  const [saleFormName, setSaleFormName] = useState("");
+  const [saleFormType, setSaleFormType] = useState<SaleRecordType>("item");
+  const [saleFormQuantity, setSaleFormQuantity] = useState("1");
+  const [saleFormUnitPrice, setSaleFormUnitPrice] = useState("");
   const [pricingSort, setPricingSort] = useState<{
     key: PricingSortKey;
     direction: "asc" | "desc";
@@ -1191,19 +2332,47 @@ export default function App() {
   const inventoryImportInputRef = useRef<HTMLInputElement | null>(null);
   const masteryImportInputRef = useRef<HTMLInputElement | null>(null);
   const isMountedRef = useRef(true);
+  const marketUsernameLoadedRef = useRef(false);
   const masteryCatalogRequestRef = useRef<Promise<MasteryItem[]> | null>(null);
   const queuedPriceJobsRef = useRef<Map<string, PriceQueueJob>>(new Map());
   const queuedPriceSlugsRef = useRef<string[]>([]);
   const activePriceRequestsRef = useRef(0);
   const activeTargetSlugsRef = useRef<Set<string>>(new Set());
+  const wikiPageCacheRef = useRef<WikiPageCache>(wikiPageCache);
   const deferredMasterySearch = useDeferredValue(
     masterySearch.trim().toLowerCase(),
   );
+  const deferredInventorySearch = useDeferredValue(
+    normalizeImportName(inventorySearch),
+  );
+  const deferredPricingSearch = useDeferredValue(
+    normalizeImportName(pricingSearch),
+  );
   const catalogImportLookup = useMemo(() => buildMarketItemLookup(catalog), [catalog]);
+  const catalogDisplayLookup = useMemo(() => buildCatalogItemLookup(catalog), [catalog]);
+  const primeSetCatalog = useMemo(
+    () => catalog.filter((item) => isPrimeSetName(item.name)),
+    [catalog],
+  );
+  const primeSetLookup = useMemo(
+    () => buildCatalogItemLookup(primeSetCatalog),
+    [primeSetCatalog],
+  );
   const masteryImportLookup = useMemo(
     () => buildMasteryEntryLookup(groupMasteryCatalogEntries(masteryCatalog)),
     [masteryCatalog],
   );
+  const deferredSaleHistorySearch = useDeferredValue(
+    normalizeImportName(saleHistorySearch),
+  );
+  const isCraftableSetInventoryView = inventoryShowAssemblableSetsOnly;
+  const isMissingSetInventoryView = inventoryShowMissingSetRequirementsOnly;
+
+  useEffect(() => {
+    if (activeSection === "statistics" && APP_SECTIONS.find((section) => section.id === "statistics")?.disabled) {
+      setActiveSection("inventory");
+    }
+  }, [activeSection]);
 
   async function ensureMasteryCatalogLoaded(forceRefresh = false) {
     if (!forceRefresh && masteryCatalogState === "ready" && masteryCatalog.length > 0) {
@@ -1258,12 +2427,51 @@ export default function App() {
   }, [language]);
 
   useEffect(() => {
+    saveToStorage(MARKET_USERNAME_KEY, marketUsername);
+  }, [marketUsername]);
+
+  useEffect(() => {
+    setMarketUsernameInput(marketUsername);
+  }, [marketUsername]);
+
+  useEffect(() => {
+    if (!marketUsernameLoadedRef.current) {
+      marketUsernameLoadedRef.current = true;
+      return;
+    }
+
+    cancelAllPriceJobs();
+    queuedPriceSlugsRef.current = [];
+    setQueuedPriceJobCount(0);
+    setLoadingSlugs(new Set());
+    setErrors({});
+    setPriceRequestMetaMap({});
+    setPriceMap(loadCachedPriceSnapshots(marketUsername));
+  }, [marketUsername]);
+
+  useEffect(() => {
     saveToStorage(MASTERY_PROGRESS_KEY, masteryProgress);
   }, [masteryProgress]);
 
   useEffect(() => {
     saveToStorage(PRICE_REQUEST_META_KEY, priceRequestMetaMap);
   }, [priceRequestMetaMap]);
+
+  useEffect(() => {
+    saveToStorage(SALE_MARKS_KEY, saleMarks);
+  }, [saleMarks]);
+
+  useEffect(() => {
+    saveToStorage(SOLD_HISTORY_KEY, soldHistory);
+  }, [soldHistory]);
+
+  useEffect(() => {
+    wikiPageCacheRef.current = wikiPageCache;
+  }, [wikiPageCache]);
+
+  useEffect(() => {
+    saveToStorage(WIKI_PAGE_CACHE_KEY, wikiPageCache);
+  }, [wikiPageCache]);
 
   useEffect(() => {
     async function loadCatalog() {
@@ -1315,6 +2523,193 @@ export default function App() {
   }, [catalog]);
 
   useEffect(() => {
+    if (catalogState !== "ready" || catalogImportLookup.size === 0) {
+      setWikiPageState("idle");
+      setWikiPageError(null);
+      return;
+    }
+
+    if (inventory.length === 0) {
+      setWikiPageState("idle");
+      setWikiPageError(null);
+      return;
+    }
+
+    let cancelled = false;
+    const controller = new AbortController();
+
+    async function loadWikiPages() {
+      try {
+        setWikiPageState("loading");
+        setWikiPageError(null);
+
+        let workingCache = { ...wikiPageCacheRef.current };
+        const queue = new Set<string>();
+        const queued = new Set<string>();
+        const processed = new Set<string>();
+        let firstError: string | null = null;
+
+        function enqueueCandidate(title: string) {
+          const normalized = normalizeWikiPageTitle(title);
+
+          if (!normalized) {
+            return;
+          }
+
+          if (processed.has(normalized) || queued.has(normalized)) {
+            return;
+          }
+
+          const cached = workingCache[normalized];
+
+          if (cached && isWikiPageCacheFresh(cached)) {
+            processed.add(normalized);
+            return;
+          }
+
+          queue.add(normalized);
+          queued.add(normalized);
+        }
+
+        for (const item of inventory) {
+          enqueueCandidate(getPrimeEntityName(item.name));
+        }
+
+        if (queue.size === 0) {
+          if (!cancelled) {
+            setWikiPageState("ready");
+            setWikiPageError(null);
+          }
+          return;
+        }
+
+        while (queue.size > 0 && !cancelled) {
+          const batch = [...queue].slice(0, 4);
+
+          for (const title of batch) {
+            queue.delete(title);
+          }
+
+          const results = await Promise.all(
+            batch.map(async (title) => {
+              const cached = workingCache[title];
+
+              if (cached && isWikiPageCacheFresh(cached)) {
+                return {
+                  requestedTitle: title,
+                  canonicalTitle: cached.data?.title ?? title,
+                  data: cached.data,
+                  error: null as string | null,
+                };
+              }
+
+              try {
+                const data = await fetchWikiPageData(
+                  title,
+                  (name) =>
+                    resolveCatalogItemLike(catalog, catalogImportLookup, name, {
+                      includeSets: false,
+                    }),
+                  controller.signal,
+                );
+
+                return {
+                  requestedTitle: title,
+                  canonicalTitle: data?.title ?? title,
+                  data,
+                  error: null as string | null,
+                };
+              } catch (error) {
+                if (isAbortError(error) || cancelled) {
+                  return {
+                    requestedTitle: title,
+                    canonicalTitle: title,
+                    data: null,
+                    error: null as string | null,
+                  };
+                }
+
+                const message =
+                  error instanceof Error ? error.message : "Не удалось загрузить вики";
+
+                return {
+                  requestedTitle: title,
+                  canonicalTitle: title,
+                  data: null,
+                  error: message,
+                };
+              }
+            }),
+          );
+
+          if (cancelled) {
+            break;
+          }
+
+          const savedAt = Date.now();
+
+          for (const result of results) {
+            const cacheEntry: WikiPageCacheEntry = {
+              savedAt,
+              data: result.data,
+            };
+
+            workingCache[result.requestedTitle] = cacheEntry;
+
+            if (result.canonicalTitle && result.canonicalTitle !== result.requestedTitle) {
+              workingCache[result.canonicalTitle] = cacheEntry;
+            }
+
+            processed.add(result.requestedTitle);
+            processed.add(result.canonicalTitle);
+            queued.delete(result.requestedTitle);
+            queued.delete(result.canonicalTitle);
+
+            if (result.error && !firstError) {
+              firstError = result.error;
+            }
+
+            if (!result.data) {
+              continue;
+            }
+
+            for (const candidate of result.data.candidateTitles) {
+              enqueueCandidate(candidate);
+            }
+          }
+        }
+
+        if (cancelled) {
+          return;
+        }
+
+        const hasAnyData = Object.values(workingCache).some((entry) => !!entry.data);
+
+        setWikiPageCache(workingCache);
+        setWikiPageState(firstError && !hasAnyData ? "error" : "ready");
+        setWikiPageError(firstError && !hasAnyData ? firstError : null);
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+
+        const message =
+          error instanceof Error ? error.message : "Не удалось загрузить вики";
+
+        setWikiPageState("error");
+        setWikiPageError(message);
+      }
+    }
+
+    void loadWikiPages();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [catalogImportLookup, catalogState, inventory]);
+
+  useEffect(() => {
     if (
       (activeSection !== "mastery" &&
         activeSection !== "pricing" &&
@@ -1340,7 +2735,12 @@ export default function App() {
 
   useEffect(() => {
     setVisibleInventoryCount(SECTION_RENDER_CHUNK_SIZE);
-  }, [inventoryMasteryFilter]);
+  }, [
+    deferredInventorySearch,
+    inventoryMasteryFilter,
+    inventoryShowAssemblableSetsOnly,
+    inventoryShowMissingSetRequirementsOnly,
+  ]);
 
   useEffect(() => {
     setVisiblePricingCount(SECTION_RENDER_CHUNK_SIZE);
@@ -1370,8 +2770,9 @@ export default function App() {
 
     if (job.started && job.controller) {
       job.controller.abort();
+      job.resolve(null);
     } else {
-      job.reject(createAbortError());
+      job.resolve(null);
     }
 
     if (isMountedRef.current) {
@@ -1431,6 +2832,7 @@ export default function App() {
       void fetchPrimePrice(job.item, {
         force: job.force,
         signal: job.controller.signal,
+        marketUsername,
       })
         .then((snapshot) => {
           const isCurrentJob = queuedPriceJobsRef.current.get(slug) === job;
@@ -1658,6 +3060,10 @@ export default function App() {
           return false;
         }
 
+        if (isPrimeSetName(item.name)) {
+          return false;
+        }
+
         const localizedName = getLocalizedName(item.names, item.name, language);
         const englishName = item.names.en;
         const russianName = item.names.ru ?? "";
@@ -1683,6 +3089,64 @@ export default function App() {
   );
   const activeSectionMeta =
     APP_SECTIONS.find((section) => section.id === activeSection) ?? APP_SECTIONS[0];
+  const saleHistorySummary = useMemo(() => {
+    return soldHistory.reduce(
+      (summary, record) => {
+        summary.records += 1;
+        summary.units += record.quantity;
+        summary.revenue +=
+          record.unitPrice !== null ? record.unitPrice * record.quantity : 0;
+        summary.setUnits += record.type === "set" ? record.quantity : 0;
+        summary.itemUnits += record.type === "item" ? record.quantity : 0;
+        summary.manualRecords += record.source === "manual" ? 1 : 0;
+        summary.autoRecords += record.source === "auto" ? 1 : 0;
+        summary.uniqueSlugs.add(record.item.slug);
+        return summary;
+      },
+      {
+        records: 0,
+        units: 0,
+        revenue: 0,
+        setUnits: 0,
+        itemUnits: 0,
+        manualRecords: 0,
+        autoRecords: 0,
+        uniqueSlugs: new Set<string>(),
+      },
+    );
+  }, [soldHistory]);
+  const filteredSoldHistory = useMemo(() => {
+    return soldHistory.filter((record) => {
+      if (saleHistoryTypeFilter !== "all" && record.type !== saleHistoryTypeFilter) {
+        return false;
+      }
+
+      return matchesSoldHistorySearch(record, deferredSaleHistorySearch);
+    });
+  }, [deferredSaleHistorySearch, saleHistoryTypeFilter, soldHistory]);
+  const saleFormResolvedItem = useMemo(() => {
+    const trimmedName = saleFormName.trim();
+
+    if (!trimmedName) {
+      return null;
+    }
+
+    return saleFormType === "set"
+      ? resolveCatalogItemLike(primeSetCatalog, primeSetLookup, trimmedName)
+      : resolveCatalogItemLike(catalog, catalogImportLookup, trimmedName, {
+          includeSets: false,
+        });
+  }, [
+    catalog,
+    catalogImportLookup,
+    primeSetCatalog,
+    primeSetLookup,
+    saleFormName,
+    saleFormType,
+  ]);
+  const saleFormResolvedDisplayName = saleFormResolvedItem
+    ? getDisplayName(saleFormResolvedItem.names, saleFormResolvedItem.name, language)
+    : null;
 
   const masteryCatalogEntries = useMemo(
     () => groupMasteryCatalogEntries(masteryCatalog),
@@ -1732,30 +3196,130 @@ export default function App() {
   }, [masteryCatalogEntries]);
 
   const rowsWithMastery = useMemo(() => {
-    return rows.map((row) => {
-      const normalizedRowName = normalizeLookupText(row.name);
-      const masteryMatch = pricingMasteryLookup.find(
-        (item) =>
-          normalizedRowName === item.normalizedName ||
-          normalizedRowName.startsWith(`${item.normalizedName} `),
-      );
-      const masteryStatus = masteryMatch
-        ? masteryMatch.sourceIds.some((itemId) => !!masteryProgress[itemId])
-        : null;
-
-      return {
-        row,
-        masteryStatus,
-        total:
-          row.price?.minSellPrice !== null && row.price
-            ? row.price.minSellPrice * row.quantity
-            : null,
-      };
-    });
+    return rows.map((row) =>
+      createInventoryDisplayEntry(row, pricingMasteryLookup, masteryProgress),
+    );
   }, [masteryProgress, pricingMasteryLookup, rows]);
 
+  const { craftableRows: wikiSetRows, missingRows: wikiMissingSetRows } = useMemo(
+    () =>
+      buildWikiSetRows({
+        rows,
+        catalog,
+        catalogDisplayLookup,
+        wikiPageCache,
+        priceMap,
+        loadingSlugs,
+        errors,
+        pricingMasteryLookup,
+        masteryProgress,
+        language,
+      }),
+    [
+      catalog,
+      catalogDisplayLookup,
+      errors,
+      language,
+      masteryProgress,
+      loadingSlugs,
+      priceMap,
+      pricingMasteryLookup,
+      rows,
+      wikiPageCache,
+    ],
+  );
+
+  const inventorySourceRows = useMemo(
+    () =>
+      isCraftableSetInventoryView
+        ? wikiSetRows
+        : isMissingSetInventoryView
+          ? wikiMissingSetRows
+          : rowsWithMastery,
+    [isCraftableSetInventoryView, isMissingSetInventoryView, rowsWithMastery, wikiMissingSetRows, wikiSetRows],
+  );
+
+  const pricingSourceRows = useMemo(
+    () => (pricingShowAssemblableSetsOnly ? wikiSetRows : rowsWithMastery),
+    [pricingShowAssemblableSetsOnly, rowsWithMastery, wikiSetRows],
+  );
+
+  const saleItemSlugSet = useMemo(
+    () => new Set(saleMarks.itemSlugs),
+    [saleMarks.itemSlugs],
+  );
+  const saleSetSlugSet = useMemo(
+    () => new Set(saleMarks.setSlugs),
+    [saleMarks.setSlugs],
+  );
+  const setComponentLookup = useMemo(() => {
+    const lookup = new Map<string, Set<string>>();
+
+    for (const entry of wikiSetRows) {
+      if (!entry.recipeIngredients) {
+        continue;
+      }
+
+      for (const ingredient of entry.recipeIngredients) {
+        const current = lookup.get(ingredient.slug);
+
+        if (current) {
+          current.add(entry.row.slug);
+        } else {
+          lookup.set(ingredient.slug, new Set([entry.row.slug]));
+        }
+      }
+    }
+
+    return lookup;
+  }, [wikiSetRows]);
+
+  useEffect(() => {
+    if (wikiPageState !== "ready") {
+      return;
+    }
+
+    const inventorySlugs = new Set(inventory.map((item) => item.slug));
+    const availableSetSlugs = new Set(wikiSetRows.map((entry) => entry.row.slug));
+
+    setSaleMarks((current) => {
+      const nextItemSlugs = current.itemSlugs.filter((slug) => inventorySlugs.has(slug));
+      const nextSetSlugs = current.setSlugs.filter((slug) => availableSetSlugs.has(slug));
+      const nextItemSalePrices = filterRecordByKeys(
+        current.itemSalePrices,
+        inventorySlugs,
+      );
+      const nextSetSalePrices = filterRecordByKeys(
+        current.setSalePrices,
+        availableSetSlugs,
+      );
+
+      if (
+        nextItemSlugs.length === current.itemSlugs.length &&
+        nextSetSlugs.length === current.setSlugs.length &&
+        nextItemSlugs.every((slug, index) => slug === current.itemSlugs[index]) &&
+        nextSetSlugs.every((slug, index) => slug === current.setSlugs[index]) &&
+        nextItemSalePrices === current.itemSalePrices &&
+        nextSetSalePrices === current.setSalePrices
+      ) {
+        return current;
+      }
+
+      return {
+        itemSlugs: nextItemSlugs,
+        setSlugs: nextSetSlugs,
+        itemSalePrices: nextItemSalePrices,
+        setSalePrices: nextSetSalePrices,
+      };
+    });
+  }, [inventory, wikiPageState, wikiSetRows]);
+
   const inventoryRows = useMemo(() => {
-    return rowsWithMastery.filter((entry) => {
+    return inventorySourceRows.filter((entry) => {
+      if (!matchesInventorySearch(entry.row, deferredInventorySearch)) {
+        return false;
+      }
+
       if (inventoryMasteryFilter === "all") {
         return true;
       }
@@ -1770,7 +3334,7 @@ export default function App() {
 
       return !entry.masteryStatus;
     });
-  }, [inventoryMasteryFilter, rowsWithMastery]);
+  }, [deferredInventorySearch, inventoryMasteryFilter, inventorySourceRows]);
   const visibleInventoryRows = useMemo(
     () => inventoryRows.slice(0, visibleInventoryCount),
     [inventoryRows, visibleInventoryCount],
@@ -1778,7 +3342,15 @@ export default function App() {
   const hasMoreInventoryRows = visibleInventoryRows.length < inventoryRows.length;
 
   const pricingRows = useMemo(() => {
-    const filteredRows = rowsWithMastery.filter((entry) => {
+    const filteredRows = pricingSourceRows.filter((entry) => {
+      if (pricingShowOnSaleOnly && !isEntryOnSale(entry)) {
+        return false;
+      }
+
+      if (!matchesInventorySearch(entry.row, deferredPricingSearch)) {
+        return false;
+      }
+
       if (pricingMasteryFilter === "all") {
         return true;
       }
@@ -1828,7 +3400,16 @@ export default function App() {
           return 0;
       }
     });
-  }, [pricingMasteryFilter, pricingSort, rowsWithMastery]);
+  }, [
+    deferredPricingSearch,
+    pricingMasteryFilter,
+    pricingShowOnSaleOnly,
+    saleItemSlugSet,
+    saleSetSlugSet,
+    setComponentLookup,
+    pricingSort,
+    pricingSourceRows,
+  ]);
   const visiblePricingRows = useMemo(
     () => pricingRows.slice(0, visiblePricingCount),
     [pricingRows, visiblePricingCount],
@@ -2018,6 +3599,10 @@ export default function App() {
       return;
     }
 
+    if (isBulkRefreshing || isAutoPriceRefreshPaused) {
+      return;
+    }
+
     const itemsToRefresh = autoRefreshItems.filter((item) => {
       if (queuedPriceJobsRef.current.has(item.slug) || loadingSlugs.has(item.slug)) {
         return false;
@@ -2047,7 +3632,124 @@ export default function App() {
     loadingSlugs,
     priceMap,
     priceRequestMetaMap,
+    isBulkRefreshing,
+    isAutoPriceRefreshPaused,
   ]);
+
+  useEffect(() => {
+    setIsAutoPriceRefreshPaused(false);
+    setIsRefreshAllButtonHovered(false);
+  }, [activeSection]);
+
+  const priceRetentionSlugs = useMemo(() => {
+    const slugs = new Set(inventory.map((item) => item.slug));
+
+    if (activeSection === "pricing" && pricingShowAssemblableSetsOnly) {
+      for (const entry of pricingSourceRows) {
+        slugs.add(entry.row.slug);
+      }
+    }
+
+    return [...slugs].sort();
+  }, [
+    activeSection,
+    inventory,
+    pricingShowAssemblableSetsOnly,
+    pricingSourceRows,
+  ]);
+
+  const priceRetentionSlugsKey = priceRetentionSlugs.join("|");
+
+  useEffect(() => {
+    const targetSlugs = new Set(priceRetentionSlugs);
+
+    for (const slug of [...queuedPriceJobsRef.current.keys()]) {
+      if (!targetSlugs.has(slug)) {
+        cancelPriceJob(slug);
+      }
+    }
+
+    setPriceMap((current) => {
+      const nextEntries = Object.entries(current).filter(([slug]) =>
+        targetSlugs.has(slug),
+      );
+
+      if (nextEntries.length === Object.keys(current).length) {
+        return current;
+      }
+
+      return Object.fromEntries(nextEntries);
+    });
+
+    setPriceRequestMetaMap((current) => {
+      const nextEntries = Object.entries(current).filter(([slug]) =>
+        targetSlugs.has(slug),
+      );
+
+      if (nextEntries.length === Object.keys(current).length) {
+        return current;
+      }
+
+      return Object.fromEntries(nextEntries);
+    });
+
+    setErrors((current) => {
+      const nextEntries = Object.entries(current).filter(([slug]) =>
+        targetSlugs.has(slug),
+      );
+
+      if (nextEntries.length === Object.keys(current).length) {
+        return current;
+      }
+
+      return Object.fromEntries(nextEntries);
+    });
+  }, [priceRetentionSlugsKey]);
+
+  const refreshAllTargets = useMemo(() => {
+    if (activeSection === "pricing") {
+      return pricingRows;
+    }
+
+    if (activeSection === "ducats") {
+      return ducatRows;
+    }
+
+    return [];
+  }, [activeSection, ducatRows, pricingSourceRows]);
+
+  const refreshProgress = useMemo(() => {
+    if (refreshAllTargets.length === 0) {
+      return null;
+    }
+
+    let completed = 0;
+    let active = 0;
+
+    for (const { row } of refreshAllTargets) {
+      const slug = row.slug;
+      const isActiveJob =
+        loadingSlugs.has(slug) || queuedPriceJobsRef.current.has(slug);
+
+      if (isActiveJob) {
+        active += 1;
+        continue;
+      }
+
+      const snapshot = priceMap[slug] ?? null;
+
+      if (snapshot !== null && !isPriceSnapshotStale(snapshot)) {
+        completed += 1;
+      }
+    }
+
+    return {
+      active,
+      completed,
+      remaining: Math.max(0, refreshAllTargets.length - completed),
+      total: refreshAllTargets.length,
+    };
+  }, [loadingSlugs, priceMap, queuedPriceJobCount, refreshAllTargets]);
 
   const filteredMasteryItems = useMemo(() => {
     return masteryCatalogEntries
@@ -2252,6 +3954,10 @@ export default function App() {
   }, [activeSection, ducatRows.length, hasMoreDucatRows]);
 
   function addItem(item: MarketItem) {
+    if (isPrimeSetName(item.name)) {
+      return;
+    }
+
     setInventory((current) => {
       if (current.some((entry) => entry.slug === item.slug)) {
         return current;
@@ -2272,7 +3978,16 @@ export default function App() {
   }
 
   function changeQuantity(slug: string, quantity: number) {
-    const safeQuantity = Number.isFinite(quantity) ? Math.max(1, quantity) : 1;
+    if (!Number.isFinite(quantity)) {
+      return;
+    }
+
+    if (quantity <= 0) {
+      removeItem(slug);
+      return;
+    }
+
+    const safeQuantity = Math.max(1, Math.floor(quantity));
 
     setInventory((current) =>
       current.map((item) =>
@@ -2282,8 +3997,12 @@ export default function App() {
   }
 
   function removeItem(slug: string) {
-    cancelPriceJob(slug);
+    clearItemState(slug);
     setInventory((current) => current.filter((item) => item.slug !== slug));
+  }
+
+  function clearItemState(slug: string) {
+    cancelPriceJob(slug);
     setErrors((current) => {
       const next = { ...current };
       delete next[slug];
@@ -2299,21 +4018,298 @@ export default function App() {
       delete next[slug];
       return next;
     });
+    setSaleMarks((current) => {
+      const nextItemSlugs = removeSlugFromList(current.itemSlugs, slug);
+      const nextSetSlugs = removeSlugFromList(current.setSlugs, slug);
+      const nextItemSalePrices = removeRecordValue(current.itemSalePrices, slug);
+      const nextSetSalePrices = removeRecordValue(current.setSalePrices, slug);
+
+      if (
+        nextItemSlugs === current.itemSlugs &&
+        nextSetSlugs === current.setSlugs &&
+        nextItemSalePrices === current.itemSalePrices &&
+        nextSetSalePrices === current.setSalePrices
+      ) {
+        return current;
+      }
+
+      return {
+        itemSlugs: nextItemSlugs,
+        setSlugs: nextSetSlugs,
+        itemSalePrices: nextItemSalePrices,
+        setSalePrices: nextSetSalePrices,
+      };
+    });
   }
 
-  function sellOneItem(slug: string) {
-    const target = inventory.find((item) => item.slug === slug);
+  function appendSoldRecord(
+    item: Pick<InventoryDisplayEntry["row"], "slug" | "name" | "names" | "assets">,
+    options: {
+      type: SaleRecordType;
+      quantity: number;
+      source: SaleRecordSource;
+      unitPrice: number | null;
+    },
+  ) {
+    const normalizedQuantity = Math.max(1, Math.floor(options.quantity));
+    const normalizedUnitPrice =
+      options.unitPrice === null
+        ? null
+        : Number.isFinite(options.unitPrice)
+          ? Math.max(0, Math.round(options.unitPrice))
+          : null;
+
+    setSoldHistory((current) => [
+      {
+        id: createSaleRecordId(),
+        soldAt: new Date().toISOString(),
+        type: options.type,
+        source: options.source,
+        quantity: normalizedQuantity,
+        unitPrice: normalizedUnitPrice,
+        item: {
+          slug: item.slug,
+          name: item.name,
+          ...(item.names ? { names: item.names } : {}),
+          ...(item.assets ? { assets: item.assets } : {}),
+        },
+      },
+      ...current,
+    ]);
+  }
+
+  function sellOneItem(entry: Pick<InventoryDisplayEntry, "row">) {
+    const target = inventory.find((item) => item.slug === entry.row.slug);
 
     if (!target) {
       return;
     }
 
+    appendSoldRecord(entry.row, {
+      type: "item",
+      quantity: 1,
+      source: "auto",
+      unitPrice: entry.row.price?.minSellPrice ?? null,
+    });
+
     if (target.quantity <= 1) {
-      removeItem(slug);
+      removeItem(entry.row.slug);
       return;
     }
 
-    changeQuantity(slug, target.quantity - 1);
+    changeQuantity(entry.row.slug, target.quantity - 1);
+  }
+
+  function sellAssemblableSet(
+    entry: Pick<InventoryDisplayEntry, "row" | "recipeIngredients">,
+  ) {
+    if (!entry.recipeIngredients || entry.recipeIngredients.length === 0) {
+      return;
+    }
+
+    const consumption = new Map<string, number>();
+
+    for (const ingredient of entry.recipeIngredients) {
+      consumption.set(
+        ingredient.slug,
+        (consumption.get(ingredient.slug) ?? 0) + ingredient.quantity,
+      );
+    }
+
+    if (consumption.size === 0) {
+      return;
+    }
+
+    const inventoryQuantities = new Map(
+      inventory.map((item) => [item.slug, item.quantity] as const),
+    );
+
+    for (const [slug, requiredQuantity] of consumption) {
+      if ((inventoryQuantities.get(slug) ?? 0) < requiredQuantity) {
+        return;
+      }
+    }
+
+    const removedSlugs = new Set<string>();
+    const nextInventory = inventory.flatMap((item) => {
+      const amount = consumption.get(item.slug) ?? 0;
+
+      if (amount <= 0) {
+        return [item];
+      }
+
+      const nextQuantity = item.quantity - amount;
+
+      if (nextQuantity <= 0) {
+        removedSlugs.add(item.slug);
+        return [];
+      }
+
+      return [
+        {
+          ...item,
+          quantity: nextQuantity,
+        },
+      ];
+    });
+
+    setInventory(nextInventory);
+
+    appendSoldRecord(entry.row, {
+      type: "set",
+      quantity: 1,
+      source: "auto",
+      unitPrice: entry.row.price?.minSellPrice ?? null,
+    });
+
+    for (const slug of removedSlugs) {
+      clearItemState(slug);
+    }
+  }
+
+  function cancelAllPriceJobs() {
+    for (const slug of [...queuedPriceJobsRef.current.keys()]) {
+      cancelPriceJob(slug);
+    }
+  }
+
+  function toggleSaleMark(entry: InventoryDisplayEntry) {
+    const salePrice = entry.row.price?.minSellPrice ?? null;
+
+    if (entry.isAssemblableSet) {
+      setSaleMarks((current) => {
+        const isMarked = current.setSlugs.includes(entry.row.slug);
+
+        return {
+          itemSlugs: current.itemSlugs,
+          setSlugs: toggleSlugInList(current.setSlugs, entry.row.slug),
+          itemSalePrices: current.itemSalePrices,
+          setSalePrices: isMarked
+            ? removeRecordValue(current.setSalePrices, entry.row.slug)
+            : setRecordValue(current.setSalePrices, entry.row.slug, salePrice),
+        };
+      });
+      return;
+    }
+
+    setSaleMarks((current) => {
+      const isMarked = current.itemSlugs.includes(entry.row.slug);
+
+      return {
+        itemSlugs: toggleSlugInList(current.itemSlugs, entry.row.slug),
+        setSlugs: current.setSlugs,
+        itemSalePrices: isMarked
+          ? removeRecordValue(current.itemSalePrices, entry.row.slug)
+          : setRecordValue(current.itemSalePrices, entry.row.slug, salePrice),
+        setSalePrices: current.setSalePrices,
+      };
+    });
+  }
+
+  function handleAddSoldRecord(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    setSaleHistoryFeedback(null);
+
+    const trimmedName = saleFormName.trim();
+
+    if (!trimmedName) {
+      setSaleHistoryFeedback({
+        tone: "error",
+        message: "Укажи название проданной вещи.",
+      });
+      return;
+    }
+
+    const quantityValue = Number(saleFormQuantity);
+
+    if (!Number.isFinite(quantityValue) || quantityValue < 1) {
+      setSaleHistoryFeedback({
+        tone: "error",
+        message: "Количество должно быть целым числом больше нуля.",
+      });
+      return;
+    }
+
+    const quantity = Math.max(1, Math.floor(quantityValue));
+    const priceText = saleFormUnitPrice.trim();
+    let unitPrice: number | null = null;
+
+    if (priceText.length > 0) {
+      const parsedPrice = Number(priceText.replace(",", "."));
+
+      if (!Number.isFinite(parsedPrice) || parsedPrice < 0) {
+        setSaleHistoryFeedback({
+          tone: "error",
+          message: "Цена должна быть числом или оставь поле пустым.",
+        });
+        return;
+      }
+
+      unitPrice = Math.max(0, Math.round(parsedPrice));
+    }
+
+    const resolvedItem =
+      saleFormType === "set"
+        ? resolveCatalogItemLike(primeSetCatalog, primeSetLookup, trimmedName)
+        : resolveCatalogItemLike(catalog, catalogImportLookup, trimmedName, {
+            includeSets: false,
+          });
+
+    const itemSnapshot = resolvedItem
+      ? {
+          slug: resolvedItem.slug,
+          name: resolvedItem.name,
+          names: resolvedItem.names,
+          assets: resolvedItem.assets,
+        }
+      : {
+          slug: buildManualSaleSlug(trimmedName, saleFormType),
+          name: trimmedName,
+        };
+
+    appendSoldRecord(itemSnapshot, {
+      type: saleFormType,
+      quantity,
+      source: "manual",
+      unitPrice,
+    });
+
+    const displayName = resolvedItem
+      ? getDisplayName(resolvedItem.names, resolvedItem.name, language)
+      : trimmedName;
+
+    setSaleHistoryFeedback({
+      tone: "success",
+      message: `${saleFormType === "set" ? "Комплект" : "Предмет"} «${displayName}» добавлен в статистику.`,
+    });
+    setSaleFormName("");
+    setSaleFormQuantity("1");
+    setSaleFormUnitPrice("");
+  }
+
+  function isEntryOnSale(entry: InventoryDisplayEntry) {
+    if (entry.isAssemblableSet) {
+      return saleSetSlugSet.has(entry.row.slug);
+    }
+
+    if (saleItemSlugSet.has(entry.row.slug)) {
+      return true;
+    }
+
+    const parentSetSlugs = setComponentLookup.get(entry.row.slug);
+
+    if (!parentSetSlugs) {
+      return false;
+    }
+
+    for (const setSlug of parentSetSlugs) {
+      if (saleSetSlugSet.has(setSlug)) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   function toggleMastered(itemIds: string | string[]) {
@@ -2594,7 +4590,7 @@ export default function App() {
 
   function clearAllData() {
     const confirmed = window.confirm(
-      "Очистить весь инвентарь, прогресс освоения, фильтры, настройки языка и локальные кеши приложения?",
+      "Очистить весь инвентарь, историю продаж, прогресс освоения, фильтры, настройки языка и локальные кеши приложения?",
     );
 
     if (!confirmed) {
@@ -2610,14 +4606,30 @@ export default function App() {
     activeTargetSlugsRef.current = new Set();
     setInventory([]);
     setSearch("");
+    setInventorySearch("");
     setLanguage("ru");
+    setMarketUsername("");
+    setMarketUsernameInput("");
+    setWikiPageCache({});
+    setWikiPageState("idle");
+    setWikiPageError(null);
     setInventoryImportFeedback(null);
     setMasteryImportFeedback(null);
+    setSaleHistoryFeedback(null);
     setPriceMap({});
     setPriceRequestMetaMap({});
+    setSaleMarks({
+      itemSlugs: [],
+      setSlugs: [],
+      itemSalePrices: {},
+      setSalePrices: {},
+    });
+    setSoldHistory([]);
     setLoadingSlugs(new Set());
     setErrors({});
     setIsBulkRefreshing(false);
+    setIsAutoPriceRefreshPaused(false);
+    setIsRefreshAllButtonHovered(false);
     setInventoryMasteryFilter("all");
     setPricingMasteryFilter("mastered");
     setDucatsMasteryFilter("mastered");
@@ -2631,18 +4643,45 @@ export default function App() {
     setMasteryGroup("all");
     setMasteryStatusFilter("pending");
     setMasteryPrimeFilter("all");
+    setSaleHistorySearch("");
+    setSaleHistoryTypeFilter("all");
+    setSaleFormName("");
+    setSaleFormType("item");
+    setSaleFormQuantity("1");
+    setSaleFormUnitPrice("");
     setVisibleMasteryCount(SECTION_RENDER_CHUNK_SIZE);
     setVisibleInventoryCount(SECTION_RENDER_CHUNK_SIZE);
     setVisiblePricingCount(SECTION_RENDER_CHUNK_SIZE);
     setVisibleDucatCount(SECTION_RENDER_CHUNK_SIZE);
+    setInventoryShowAssemblableSetsOnly(false);
+    setInventoryShowMissingSetRequirementsOnly(false);
+    setPricingShowAssemblableSetsOnly(false);
+    setPricingSearch("");
+    setPricingShowOnSaleOnly(false);
   }
 
   const isAnyPriceRefreshActive =
-    isBulkRefreshing || loadingSlugs.size > 0 || queuedPriceJobCount > 0;
+    isBulkRefreshing ||
+    loadingSlugs.size > 0 ||
+    queuedPriceJobCount > 0 ||
+    activePriceRequestsRef.current > 0;
+  const isPriceRefreshSection =
+    activeSection === "pricing" || activeSection === "ducats";
+  const refreshAllButtonActionLabel = isAnyPriceRefreshActive
+    ? "Отменить все запросы"
+    : "Обновить все цены";
+  const refreshAllButtonLabel = isAnyPriceRefreshActive
+    ? isRefreshAllButtonHovered
+      ? refreshAllButtonActionLabel
+      : "Обновляю цены..."
+    : refreshAllButtonActionLabel;
+  const refreshAllButtonClassName = `primary-button${
+    isAnyPriceRefreshActive && isRefreshAllButtonHovered ? " is-canceling" : ""
+  }`;
 
   async function refreshAll(force = false) {
     if (
-      inventory.length === 0 ||
+      refreshAllTargets.length === 0 ||
       isBulkRefreshing ||
       activePriceRequestsRef.current > 0 ||
       queuedPriceJobsRef.current.size > 0
@@ -2650,16 +4689,25 @@ export default function App() {
       return;
     }
 
+    setIsAutoPriceRefreshPaused(false);
     setIsBulkRefreshing(true);
 
     try {
       await Promise.allSettled(
-        inventory.map((item) =>
-          queuePriceRefresh(item, { force, source: "manual" }),
+        refreshAllTargets.map(({ row }) =>
+          queuePriceRefresh(row, { force, source: "manual" }),
         ),
       );
     } finally {
       setIsBulkRefreshing(false);
+    }
+  }
+
+  function cancelAllPriceRefreshes() {
+    setIsAutoPriceRefreshPaused(true);
+
+    for (const slug of [...queuedPriceJobsRef.current.keys()]) {
+      cancelPriceJob(slug);
     }
   }
 
@@ -2681,6 +4729,7 @@ export default function App() {
                 key={section.id}
                 className={`sidebar-tab${activeSection === section.id ? " is-active" : ""}`}
                 type="button"
+                disabled={Boolean(section.disabled)}
                 aria-label={section.label}
                 title={section.label}
                 onClick={() => setActiveSection(section.id)}
@@ -2702,24 +4751,28 @@ export default function App() {
               {activeSection === "inventory" && (
                 <div className="topbar-pill">{rows.length} предметов</div>
               )}
-              {activeSection === "pricing" && (
-                <button
-                  className="primary-button"
-                  type="button"
-                  onClick={() => void refreshAll(true)}
-                  disabled={isAnyPriceRefreshActive || inventory.length === 0}
-                >
-                  {isAnyPriceRefreshActive ? "Обновляю цены..." : "Обновить все цены"}
-                </button>
+              {activeSection === "statistics" && (
+                <div className="topbar-pill">{soldHistory.length} записей</div>
               )}
-              {activeSection === "ducats" && (
+              {isPriceRefreshSection && (
                 <button
-                  className="primary-button"
+                  className={refreshAllButtonClassName}
                   type="button"
-                  onClick={() => void refreshAll(true)}
-                  disabled={isAnyPriceRefreshActive || inventory.length === 0}
+                  onClick={() => {
+                    if (isAnyPriceRefreshActive) {
+                      cancelAllPriceRefreshes();
+                      return;
+                    }
+
+                    void refreshAll(true);
+                  }}
+                  onMouseEnter={() => setIsRefreshAllButtonHovered(true)}
+                  onMouseLeave={() => setIsRefreshAllButtonHovered(false)}
+                  disabled={refreshAllTargets.length === 0}
+                  aria-label={refreshAllButtonActionLabel}
+                  title={refreshAllButtonActionLabel}
                 >
-                  {isAnyPriceRefreshActive ? "Обновляю цены..." : "Обновить все цены"}
+                  {refreshAllButtonLabel}
                 </button>
               )}
               {activeSection === "mastery" && masteryCatalogState === "ready" && (
@@ -2768,7 +4821,7 @@ export default function App() {
                 {suggestions.length > 0 && (
                   <div className="item-grid search-suggestions-grid">
                     {suggestions.map((item) => {
-                      const localizedName = getLocalizedName(
+                      const displayName = getDisplayName(
                         item.names,
                         item.name,
                         language,
@@ -2783,8 +4836,8 @@ export default function App() {
                         >
                           <ItemPreview item={item} language={language} />
                           <div className="item-card-body item-card-body-fixed">
-                            <strong className="item-card-title" title={localizedName}>
-                              {localizedName}
+                            <strong className="item-card-title" title={displayName}>
+                              {displayName}
                             </strong>
                             <span className="item-card-slug" title={item.slug}>
                               {item.slug}
@@ -2804,54 +4857,182 @@ export default function App() {
                       <h2>Мой инвентарь</h2>
                       <p>
                         {inventoryRows.length === 0
-                          ? "Пока пусто"
-                          : inventoryMasteryFilter === "all"
-                            ? `${inventoryRows.length} позиций в коллекции`
-                            : `${inventoryRows.length} из ${rows.length} позиций`}
+                          ? isCraftableSetInventoryView
+                            ? wikiPageState === "loading"
+                              ? "Ищу составы в вики..."
+                              : wikiPageState === "error"
+                                ? "Вики сейчас недоступна"
+                                : "Пока нет доступных комплектов"
+                            : isMissingSetInventoryView
+                              ? wikiPageState === "loading"
+                                ? "Ищу составы в вики..."
+                                : wikiPageState === "error"
+                                  ? "Вики сейчас недоступна"
+                                  : "Пока нет комплектов, которым чего-то не хватает"
+                              : "Пока пусто"
+                          : inventoryMasteryFilter === "all" &&
+                              deferredInventorySearch.length === 0
+                            ? isCraftableSetInventoryView
+                              ? `${inventoryRows.length} комплектов можно собрать`
+                              : isMissingSetInventoryView
+                                ? `${inventoryRows.length} комплектов с недостающими частями`
+                                : `${inventoryRows.length} позиций в коллекции`
+                            : isCraftableSetInventoryView
+                              ? `${inventoryRows.length} из ${inventorySourceRows.length} комплектов`
+                              : isMissingSetInventoryView
+                                ? `${inventoryRows.length} из ${inventorySourceRows.length} комплектов`
+                                : `${inventoryRows.length} из ${inventorySourceRows.length} позиций`}
                       </p>
                     </div>
                   </div>
                   <span className="table-note">
-                    Управляй количеством здесь, цены смотри во вкладке стоимости.
+                    {isCraftableSetInventoryView
+                      ? wikiPageState === "loading"
+                        ? "Загружаю составы из вики..."
+                        : wikiPageState === "error" && wikiPageError
+                          ? wikiPageError
+                          : "Комплекты считаются автоматически по предметам из инвентаря."
+                      : isMissingSetInventoryView
+                        ? wikiPageState === "loading"
+                          ? "Загружаю составы из вики..."
+                          : wikiPageState === "error" && wikiPageError
+                            ? wikiPageError
+                            : "Показываю, каких предметов и сколько не хватает до полного комплекта."
+                        : "Управляй количеством здесь, цены смотри во вкладке стоимости."}
                   </span>
                 </div>
 
-                <div className="pricing-toolbar">
-                  <div className="filter-row pricing-filter-row" aria-label="Фильтр инвентаря по освоению">
-                    {PRICING_MASTERY_FILTERS.map((filter) => (
-                      <button
-                        key={filter.id}
-                        className={`filter-chip${inventoryMasteryFilter === filter.id ? " is-active" : ""}`}
-                        type="button"
-                        onClick={() => setInventoryMasteryFilter(filter.id)}
-                        disabled={
-                          filter.id !== "all" &&
-                          masteryCatalogState !== "ready"
+                <div className="inventory-tools">
+                  <div className="inventory-tools-row">
+                    <div className="inventory-search-field">
+                      <input
+                        id="inventory-owned-search"
+                        className="search-input"
+                        value={inventorySearch}
+                        onChange={(event) => setInventorySearch(event.target.value)}
+                        placeholder={
+                          isCraftableSetInventoryView
+                            ? "Поиск по доступным комплектам"
+                            : isMissingSetInventoryView
+                              ? "Поиск по недостающим комплектам"
+                            : "Поиск по моему инвентарю"
                         }
+                        autoComplete="off"
+                      />
+                    </div>
+                    <div className="inventory-switches">
+                      <button
+                        className={`inventory-switch${isCraftableSetInventoryView ? " is-active" : ""}`}
+                        type="button"
+                        onClick={() => {
+                          setInventoryShowAssemblableSetsOnly((current) => !current);
+                          setInventoryShowMissingSetRequirementsOnly(false);
+                        }}
+                        aria-pressed={isCraftableSetInventoryView}
                       >
-                        {filter.label}
+                        <span className="inventory-switch-track" aria-hidden="true">
+                          <span className="inventory-switch-thumb" />
+                        </span>
+                        <span className="inventory-switch-copy">
+                          <strong>Только комплекты</strong>
+                          <span>Показывать комплекты, которые уже можно собрать</span>
+                        </span>
                       </button>
-                    ))}
+                      <button
+                        className={`inventory-switch${isMissingSetInventoryView ? " is-active" : ""}`}
+                        type="button"
+                        onClick={() => {
+                          setInventoryShowMissingSetRequirementsOnly((current) => !current);
+                          setInventoryShowAssemblableSetsOnly(false);
+                        }}
+                        aria-pressed={isMissingSetInventoryView}
+                      >
+                        <span className="inventory-switch-track" aria-hidden="true">
+                          <span className="inventory-switch-thumb" />
+                        </span>
+                        <span className="inventory-switch-copy">
+                          <strong>Не хватает до комплекта</strong>
+                          <span>Показывать, каких предметов и сколько нужно добрать</span>
+                        </span>
+                      </button>
+                    </div>
                   </div>
-                  {masteryCatalogState === "loading" && (
-                    <span className="table-note table-note-inline">
-                      Загружаю статусы освоения...
-                    </span>
-                  )}
-                  {masteryCatalogState === "error" && (
-                    <span className="table-note table-note-inline">
-                      Статусы освоения недоступны.
-                    </span>
-                  )}
+
+                  <div className="pricing-toolbar">
+                    <div className="filter-row pricing-filter-row" aria-label="Фильтр инвентаря по освоению">
+                      {PRICING_MASTERY_FILTERS.map((filter) => (
+                        <button
+                          key={filter.id}
+                          className={`filter-chip${inventoryMasteryFilter === filter.id ? " is-active" : ""}`}
+                          type="button"
+                          onClick={() => setInventoryMasteryFilter(filter.id)}
+                          disabled={
+                            filter.id !== "all" &&
+                            masteryCatalogState !== "ready"
+                          }
+                        >
+                          {filter.label}
+                        </button>
+                      ))}
+                    </div>
+                    {masteryCatalogState === "loading" && (
+                      <span className="table-note table-note-inline">
+                        Загружаю статусы освоения...
+                      </span>
+                    )}
+                    {masteryCatalogState === "error" && (
+                      <span className="table-note table-note-inline">
+                        Статусы освоения недоступны.
+                      </span>
+                    )}
+                  </div>
                 </div>
 
                 {inventoryRows.length === 0 ? (
                   <div className="empty-state">
-                    <h3>{rows.length === 0 ? "Инвентарь пуст" : "Ничего не найдено"}</h3>
+                    <h3>
+                      {inventorySourceRows.length === 0
+                        ? rows.length === 0
+                          ? "Инвентарь пуст"
+                          : isCraftableSetInventoryView
+                            ? wikiPageState === "loading"
+                              ? "Загружаю составы..."
+                              : wikiPageState === "error"
+                                ? "Не удалось загрузить составы"
+                                : "Комплекты не найдены"
+                            : isMissingSetInventoryView
+                              ? wikiPageState === "loading"
+                                ? "Загружаю составы..."
+                                : wikiPageState === "error"
+                                  ? "Не удалось загрузить составы"
+                                  : "Пока нет комплектов, которым чего-то не хватает"
+                              : "Инвентарь пуст"
+                        : "Ничего не найдено"}
+                    </h3>
                     <p>
-                      {rows.length === 0
-                        ? "Добавь предметы через поиск выше."
-                        : "Фильтр по освоению не оставил ни одной позиции."}
+                      {inventorySourceRows.length === 0
+                        ? rows.length === 0
+                          ? "Добавь предметы через поиск выше."
+                          : isCraftableSetInventoryView
+                            ? wikiPageState === "loading"
+                              ? "Сверяю инвентарь с вики и ищу подходящие рецепты."
+                              : wikiPageState === "error"
+                                ? "Проверь подключение к вики или попробуй позже."
+                                : "Нужно собрать предметы из рецепта на вики, чтобы появился комплект."
+                            : isMissingSetInventoryView
+                              ? wikiPageState === "loading"
+                                ? "Сверяю инвентарь с вики и ищу подходящие рецепты."
+                                : wikiPageState === "error"
+                                  ? "Проверь подключение к вики или попробуй позже."
+                                  : "Из текущего инвентаря все найденные комплекты уже можно собрать."
+                              : "Добавь предметы через поиск выше."
+                        : deferredInventorySearch.length > 0
+                          ? isCraftableSetInventoryView || isMissingSetInventoryView
+                            ? "Поиск по комплектам не дал результатов."
+                            : "Поиск по инвентарю не дал результатов."
+                          : isCraftableSetInventoryView || isMissingSetInventoryView
+                            ? "Фильтр по освоению не оставил ни одного комплекта."
+                            : "Фильтр по освоению не оставил ни одной позиции."}
                     </p>
                   </div>
                 ) : (
@@ -2863,20 +5044,30 @@ export default function App() {
                     </div>
 
                     <div className="item-grid owned-grid">
-                      {visibleInventoryRows.map(({ row }) => {
-                        const localizedName = getLocalizedName(
+                      {visibleInventoryRows.map((entry) => {
+                        const { row } = entry;
+                        const displayName = getDisplayName(
                           row.names,
                           row.name,
                           language,
                         );
 
                         return (
-                          <article key={row.slug} className="item-card owned-card">
+                          <article
+                            key={`${
+                              entry.isAssemblableSet
+                                ? "set"
+                                : entry.isMissingSet
+                                  ? "missing-set"
+                                  : "item"
+                            }-${row.slug}`}
+                            className={`item-card owned-card${entry.isAssemblableSet ? " assemblable-set-card" : ""}${entry.isMissingSet ? " missing-set-card" : ""}`}
+                          >
                             <ItemPreview item={row} language={language} />
 
                             <div className="item-card-body item-card-body-fixed">
-                              <strong className="item-card-title" title={localizedName}>
-                                {localizedName}
+                              <strong className="item-card-title" title={displayName}>
+                                {displayName}
                               </strong>
                               <span className="item-card-slug" title={row.slug}>
                                 {row.slug}
@@ -2884,32 +5075,51 @@ export default function App() {
                             </div>
 
                             <div className="owned-card-footer">
-                              <div className="owned-card-meta">
-                                <label className="card-quantity" aria-label="Количество предметов">
-                                  <input
-                                    className="quantity-input"
-                                    type="number"
-                                    min={1}
-                                    step={1}
-                                    value={row.quantity}
-                                    onChange={(event) =>
-                                      changeQuantity(
-                                        row.slug,
-                                        Number.parseInt(event.target.value, 10),
-                                      )
-                                    }
-                                  />
-                                </label>
-                                <button
-                                  className="danger-button icon-button inventory-delete-button"
-                                  type="button"
-                                  onClick={() => removeItem(row.slug)}
-                                  aria-label="Удалить предмет"
-                                  title="Удалить предмет"
-                                >
-                                  <TrashIcon />
-                                </button>
-                              </div>
+                              {entry.isAssemblableSet ? (
+                                <div className="assemblable-set-footer">
+                                  <span className="assemblable-set-badge">Комплект</span>
+                                  <div className="assemblable-set-stats">
+                                    <strong>Можно собрать: {row.quantity}</strong>
+                                    <span title={entry.recipeSummary}>{entry.recipeSummary}</span>
+                                  </div>
+                                </div>
+                              ) : entry.isMissingSet ? (
+                                <div className="assemblable-set-footer is-missing">
+                                  <span className="assemblable-set-badge is-missing">Не хватает</span>
+                                  <div className="assemblable-set-stats">
+                                    <strong>
+                                      Не хватает: {entry.missingPartCount ?? 0} шт.
+                                    </strong>
+                                    <span title={entry.missingSummary ?? entry.recipeSummary ?? ""}>
+                                      {entry.missingSummary ?? entry.recipeSummary}
+                                    </span>
+                                  </div>
+                                </div>
+                              ) : (
+                                <>
+                                  <button
+                                    className="quantity-stepper-button"
+                                    type="button"
+                                    onClick={() => changeQuantity(row.slug, row.quantity - 1)}
+                                    aria-label="Уменьшить количество"
+                                    title="Уменьшить количество"
+                                  >
+                                    -
+                                  </button>
+                                  <span className="quantity-stepper-value" aria-live="polite">
+                                    {row.quantity}
+                                  </span>
+                                  <button
+                                    className="quantity-stepper-button"
+                                    type="button"
+                                    onClick={() => changeQuantity(row.slug, row.quantity + 1)}
+                                    aria-label="Увеличить количество"
+                                    title="Увеличить количество"
+                                  >
+                                    +
+                                  </button>
+                                </>
+                              )}
                             </div>
                           </article>
                         );
@@ -2943,6 +5153,264 @@ export default function App() {
                 )}
               </section>
             </div>
+          ) : activeSection === "statistics" ? (
+            <>
+              <section className="summary-grid">
+                <article className="summary-card">
+                  <span>Записей</span>
+                  <strong>{saleHistorySummary.records}</strong>
+                </article>
+                <article className="summary-card">
+                  <span>Штук</span>
+                  <strong>{saleHistorySummary.units}</strong>
+                </article>
+                <article className="summary-card">
+                  <span>Комплектов</span>
+                  <strong>{saleHistorySummary.setUnits}</strong>
+                </article>
+                <article className="summary-card">
+                  <span>Платина</span>
+                  <strong>{formatPlatinum(saleHistorySummary.revenue)}</strong>
+                </article>
+              </section>
+
+              <section className="panel statistics-panel">
+                <div className="section-heading section-heading-row">
+                  <div>
+                    <h2>Добавить продажу</h2>
+                    <p>
+                      Запись сохраняется отдельно от инвентаря и не влияет на количество
+                      предметов.
+                    </p>
+                  </div>
+                  <span className="table-note">
+                    Можно добавить вручную любой предмет или комплект. Цена за шт. не обязательна,
+                    но без неё запись не попадёт в сумму.
+                  </span>
+                </div>
+
+                <form className="sale-form" onSubmit={handleAddSoldRecord}>
+                  <div className="sale-form-grid">
+                    <label className="sale-form-field sale-form-field-wide">
+                      <span>Название</span>
+                      <input
+                        className="search-input sale-form-input"
+                        value={saleFormName}
+                        onChange={(event) => setSaleFormName(event.target.value)}
+                        placeholder="Wukong Prime Set"
+                        autoComplete="off"
+                      />
+                    </label>
+
+                    <label className="sale-form-field">
+                      <span>Тип</span>
+                      <select
+                        className="search-input sale-form-input sale-form-select"
+                        value={saleFormType}
+                        onChange={(event) =>
+                          setSaleFormType(event.target.value as SaleRecordType)
+                        }
+                      >
+                        <option value="item">Предмет</option>
+                        <option value="set">Комплект</option>
+                      </select>
+                    </label>
+
+                    <label className="sale-form-field">
+                      <span>Количество</span>
+                      <input
+                        className="search-input sale-form-input"
+                        type="number"
+                        min="1"
+                        step="1"
+                        value={saleFormQuantity}
+                        onChange={(event) => setSaleFormQuantity(event.target.value)}
+                        inputMode="numeric"
+                      />
+                    </label>
+
+                    <label className="sale-form-field">
+                      <span>Цена за шт.</span>
+                      <input
+                        className="search-input sale-form-input"
+                        type="number"
+                        min="0"
+                        step="1"
+                        value={saleFormUnitPrice}
+                        onChange={(event) => setSaleFormUnitPrice(event.target.value)}
+                        placeholder="Необязательно"
+                        inputMode="numeric"
+                      />
+                    </label>
+                  </div>
+
+                  <div className="sale-form-actions">
+                    <button className="primary-button" type="submit">
+                      Добавить в статистику
+                    </button>
+                    <span className="table-note sale-form-note">
+                      {saleFormResolvedItem
+                        ? `Найдено в каталоге: ${saleFormResolvedDisplayName}.`
+                        : saleFormName.trim().length > 0
+                          ? "Запись будет сохранена как ручная."
+                          : "Можно добавить запись вручную без сопоставления с каталогом."}
+                    </span>
+                  </div>
+
+                  {saleHistoryFeedback && (
+                    <p
+                      className={`settings-status${saleHistoryFeedback.tone === "error" ? " is-error" : " is-success"}`}
+                    >
+                      {saleHistoryFeedback.message}
+                    </p>
+                  )}
+
+                  {saleFormResolvedItem && (
+                    <div className="sale-form-preview">
+                      <ItemPreview item={saleFormResolvedItem} language={language} />
+                      <div className="sale-form-preview-copy">
+                        <strong>{saleFormResolvedDisplayName}</strong>
+                        <span>
+                          {saleFormType === "set" ? "Комплект" : "Предмет"} будет сохранён
+                          как {saleFormResolvedItem.slug}
+                        </span>
+                      </div>
+                    </div>
+                  )}
+                </form>
+              </section>
+
+              <section className="panel statistics-panel">
+                <div className="section-heading section-heading-row">
+                  <div>
+                    <h2>История продаж</h2>
+                    <p>
+                      {filteredSoldHistory.length === 0
+                        ? soldHistory.length === 0
+                          ? "Пока нет записей"
+                          : "Ничего не найдено"
+                        : `${filteredSoldHistory.length} из ${soldHistory.length} записей`}
+                    </p>
+                  </div>
+                  <span className="table-note">
+                    Поиск работает по названию, slug, типу записи и источнику.
+                  </span>
+                </div>
+
+                <div className="inventory-tools statistics-tools">
+                  <div className="inventory-tools-row">
+                    <div className="inventory-search-field">
+                      <input
+                        className="search-input"
+                        value={saleHistorySearch}
+                        onChange={(event) => setSaleHistorySearch(event.target.value)}
+                        placeholder="Поиск по проданным вещам"
+                        autoComplete="off"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="filter-row pricing-filter-row" aria-label="Фильтр истории продаж">
+                    {SALE_HISTORY_TYPE_FILTERS.map((filter) => (
+                      <button
+                        key={filter.id}
+                        className={`filter-chip${saleHistoryTypeFilter === filter.id ? " is-active" : ""}`}
+                        type="button"
+                        onClick={() => setSaleHistoryTypeFilter(filter.id)}
+                      >
+                        {filter.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {filteredSoldHistory.length === 0 ? (
+                  <div className="empty-state">
+                    <h3>
+                      {soldHistory.length === 0
+                        ? "История продаж пуста"
+                        : "Ничего не найдено"}
+                    </h3>
+                    <p>
+                      {soldHistory.length === 0
+                        ? "Добавь первую продажу вручную или списывай предметы кнопкой «Продано» в таблицах цен."
+                        : "Сбрось фильтр или поменяй запрос, чтобы увидеть нужную запись."}
+                    </p>
+                  </div>
+                ) : (
+                  <>
+                    <div className="progressive-results-meta">
+                      <span>
+                        Показано {filteredSoldHistory.length} из {soldHistory.length}
+                      </span>
+                      <span>
+                        {saleHistorySummary.manualRecords} ручных, {saleHistorySummary.autoRecords} автоматически
+                      </span>
+                    </div>
+
+                    <div className="table-wrap">
+                      <table className="inventory-table statistics-table">
+                        <thead>
+                          <tr>
+                            <th>Продано</th>
+                            <th>Тип</th>
+                            <th>Кол-во</th>
+                            <th>Цена за шт.</th>
+                            <th>Сумма</th>
+                            <th>Источник</th>
+                            <th>Дата</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {filteredSoldHistory.map((record) => {
+                            const displayName = getDisplayName(
+                              record.item.names,
+                              record.item.name,
+                              language,
+                            );
+                            const totalPrice =
+                              record.unitPrice !== null
+                                ? record.unitPrice * record.quantity
+                                : null;
+
+                            return (
+                              <tr
+                                key={record.id}
+                                className={record.source === "manual" ? "is-manual-sale" : "is-auto-sale"}
+                              >
+                                <td>
+                                  <div className="item-name-row">
+                                    <ItemTablePreview item={record.item} language={language} />
+                                    <div className="item-name-cell">
+                                      <strong>{displayName}</strong>
+                                      <span>{record.item.slug}</span>
+                                    </div>
+                                  </div>
+                                </td>
+                                <td>
+                                  <span className="sale-record-badge">
+                                    {formatSaleRecordTypeLabel(record.type)}
+                                  </span>
+                                </td>
+                                <td>{record.quantity}</td>
+                                <td>{formatPlatinum(record.unitPrice)}</td>
+                                <td>{formatPlatinum(totalPrice)}</td>
+                                <td>
+                                  <span className="sale-record-badge is-muted">
+                                    {formatSaleRecordSourceLabel(record.source)}
+                                  </span>
+                                </td>
+                                <td>{formatTimestamp(record.soldAt)}</td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </>
+                )}
+              </section>
+            </>
           ) : activeSection === "pricing" ? (
             <>
               <section className="summary-grid">
@@ -2967,16 +5435,65 @@ export default function App() {
               <section className="panel pricing-panel">
                 <div className="section-heading section-heading-row">
                   <div>
-                    <h2>Стоимость прайм предметов</h2>
+                    <h2>
+                      {pricingShowAssemblableSetsOnly
+                        ? "Стоимость комплектов"
+                        : "Стоимость прайм предметов"}
+                    </h2>
                     <p>
                       {pricingRows.length === 0
-                        ? "Пусто"
+                        ? pricingShowAssemblableSetsOnly
+                          ? pricingSourceRows.length === 0
+                            ? "Комплекты не найдены"
+                            : "Фильтр не оставил ни одного комплекта."
+                          : rows.length === 0
+                            ? "Пусто"
+                            : "Фильтр не оставил ни одной позиции."
                         : `${pricingRows.length} позиций`}
                     </p>
                   </div>
                   <span className="table-note">
-                    Продажа = минимальная цена у продавцов, покупка = лучшая ставка покупателя
+                    {pricingShowAssemblableSetsOnly
+                      ? "Показываю комплекты, которые можно собрать из текущего инвентаря. Кнопка «На продаже» помечает комплект и его компоненты, а «Продано» списывает компоненты комплекта. Цена берётся по комплекту на warframe.market и не учитывает твои лоты, если указан ник."
+                      : "Продажа = минимальная цена у продавцов, но твои лоты исключаются из расчёта, если указан ник. Покупка = лучшая ставка покупателя. Кнопка «На продаже» помечает предмет для отслеживания."}
                   </span>
+                </div>
+
+                <div className="inventory-tools pricing-tools">
+                  <div className="inventory-tools-row">
+                    <div className="inventory-search-field">
+                      <input
+                        id="pricing-owned-search"
+                        className="search-input"
+                        value={pricingSearch}
+                        onChange={(event) => setPricingSearch(event.target.value)}
+                        placeholder={
+                          pricingShowAssemblableSetsOnly
+                            ? "Поиск по комплектам"
+                            : "Поиск по прайм-предметам"
+                        }
+                        autoComplete="off"
+                      />
+                    </div>
+                    <div className="inventory-switches">
+                      <button
+                        className={`inventory-switch pricing-switch${pricingShowOnSaleOnly ? " is-active" : ""}`}
+                        type="button"
+                        onClick={() =>
+                          setPricingShowOnSaleOnly((current) => !current)
+                        }
+                        aria-pressed={pricingShowOnSaleOnly}
+                      >
+                        <span className="inventory-switch-track" aria-hidden="true">
+                          <span className="inventory-switch-thumb" />
+                        </span>
+                        <span className="inventory-switch-copy">
+                          <strong>Только на продаже</strong>
+                          <span>Показывать только позиции с меткой продажи</span>
+                        </span>
+                      </button>
+                    </div>
+                  </div>
                 </div>
 
                 <div className="pricing-toolbar">
@@ -2996,6 +5513,22 @@ export default function App() {
                       </button>
                     ))}
                   </div>
+                  <button
+                    className={`inventory-switch pricing-switch${pricingShowAssemblableSetsOnly ? " is-active" : ""}`}
+                    type="button"
+                    onClick={() =>
+                      setPricingShowAssemblableSetsOnly((current) => !current)
+                    }
+                    aria-pressed={pricingShowAssemblableSetsOnly}
+                  >
+                    <span className="inventory-switch-track" aria-hidden="true">
+                      <span className="inventory-switch-thumb" />
+                    </span>
+                    <span className="inventory-switch-copy">
+                      <strong>Комплекты</strong>
+                      <span>Показывать цены по собранным сетам</span>
+                    </span>
+                  </button>
                   {masteryCatalogState === "loading" && (
                     <span className="table-note table-note-inline">
                       Загружаю статусы освоения...
@@ -3008,13 +5541,37 @@ export default function App() {
                   )}
                 </div>
 
+                {refreshProgress && (
+                  <RefreshProgressBar
+                    label="Прогресс обновления цен"
+                    completed={refreshProgress.completed}
+                    total={refreshProgress.total}
+                    remaining={refreshProgress.remaining}
+                    active={refreshProgress.active}
+                  />
+                )}
+
                 {pricingRows.length === 0 ? (
                   <div className="empty-state">
-                    <h3>Нет предметов для оценки</h3>
+                    <h3>
+                      {pricingShowAssemblableSetsOnly
+                        ? pricingSourceRows.length === 0
+                          ? "Нет комплектов для оценки"
+                          : "Фильтр не оставил комплектов"
+                        : rows.length === 0
+                          ? "Нет предметов для оценки"
+                          : "Фильтр не оставил ни одной позиции"}
+                    </h3>
                     <p>
-                      {rows.length === 0
-                        ? "Сначала добавь их во вкладке инвентаря."
-                        : "Фильтр не оставил ни одной позиции."}
+                      {pricingShowAssemblableSetsOnly
+                        ? pricingSourceRows.length === 0
+                          ? rows.length === 0
+                            ? "Сначала добавь предметы во вкладке инвентаря."
+                            : "Из текущего инвентаря пока нельзя собрать ни один комплект."
+                          : "Фильтр не оставил ни одного комплекта."
+                        : rows.length === 0
+                          ? "Сначала добавь их во вкладке инвентаря."
+                          : "Фильтр не оставил ни одной позиции."}
                     </p>
                   </div>
                 ) : (
@@ -3049,15 +5606,7 @@ export default function App() {
                                 Мин. продажа{getPricingSortMarker("minSellPrice")}
                               </button>
                             </th>
-                            <th>
-                              <button
-                                className={`table-sort-button${pricingSort?.key === "maxBuyPrice" ? " is-active" : ""}`}
-                                type="button"
-                                onClick={() => togglePricingSort("maxBuyPrice")}
-                              >
-                                Макс. покупка{getPricingSortMarker("maxBuyPrice")}
-                              </button>
-                            </th>
+                            <th>Цена при выставлении</th>
                             <th>
                               <button
                                 className={`table-sort-button${pricingSort?.key === "total" ? " is-active" : ""}`}
@@ -3080,16 +5629,52 @@ export default function App() {
                           </tr>
                         </thead>
                         <tbody>
-                          {visiblePricingRows.map(({ row, total, masteryStatus }) => {
+                          {visiblePricingRows.map((entry) => {
+                            const { row, total, masteryStatus } = entry;
+                            const isAssemblableSetRow = !!entry.isAssemblableSet;
+                            const isOnSale = isEntryOnSale(entry);
+                            const isDirectSaleMarked = isAssemblableSetRow
+                              ? saleSetSlugSet.has(row.slug)
+                              : saleItemSlugSet.has(row.slug);
+                            const salePriceRecord = isAssemblableSetRow
+                              ? saleMarks.setSalePrices
+                              : saleMarks.itemSalePrices;
+                            const currentMinSellPrice = row.price?.minSellPrice ?? null;
+                            const salePriceAtMark = salePriceRecord[row.slug] ?? null;
+                            const isSalePriceEmpty = !isDirectSaleMarked || salePriceAtMark === null;
+                            const isSalePriceBelowMin =
+                              isDirectSaleMarked &&
+                              salePriceAtMark !== null &&
+                              currentMinSellPrice !== null &&
+                              salePriceAtMark < currentMinSellPrice;
+                            const isSalePriceAboveMin =
+                              isDirectSaleMarked &&
+                              salePriceAtMark !== null &&
+                              currentMinSellPrice !== null &&
+                              salePriceAtMark > currentMinSellPrice;
+                            const saleButtonLabel = isAssemblableSetRow
+                              ? isOnSale
+                                ? "Снять комплект с продажи"
+                                : "Пометить комплект на продаже"
+                              : saleItemSlugSet.has(row.slug)
+                                ? "Снять с продажи"
+                                : isOnSale
+                                  ? "На продаже через комплект"
+                                  : "Пометить на продаже";
+                            const canSellRow =
+                              !isAssemblableSetRow ||
+                              (entry.recipeIngredients?.length ?? 0) > 0;
+                            const handleSellRow = isAssemblableSetRow
+                              ? () => sellAssemblableSet(entry)
+                              : () => sellOneItem(entry);
+
                             return (
-                              <tr key={row.slug}>
+                              <tr key={row.slug} className={isOnSale ? "is-on-sale" : ""}>
                                 <td>
                                   <div className="item-name-row">
                                     <ItemTablePreview item={row} language={language} />
                                     <div className="item-name-cell">
-                                      <strong>
-                                        {getLocalizedName(row.names, row.name, language)}
-                                      </strong>
+                                      <strong>{getDisplayName(row.names, row.name, language)}</strong>
                                       <span>{row.slug}</span>
                                       {row.error && (
                                         <span className="inline-error">{row.error}</span>
@@ -3101,18 +5686,45 @@ export default function App() {
                                   <MasteryStatusIcon status={masteryStatus} />
                                 </td>
                                 <td>{row.quantity}</td>
-                                <td>{formatPlatinum(row.price?.minSellPrice ?? null)}</td>
-                                <td>{formatPlatinum(row.price?.maxBuyPrice ?? null)}</td>
+                                <td>{formatPlatinum(currentMinSellPrice)}</td>
+                                <td>
+                                  <div
+                                    className={`sale-price-cell${isSalePriceEmpty ? " is-empty" : ""}${isSalePriceBelowMin ? " is-below-min" : ""}${isSalePriceAboveMin ? " is-above-min" : ""}`}
+                                  >
+                                    {salePriceAtMark !== null
+                                      ? formatPlatinum(salePriceAtMark)
+                                      : "—"}
+                                  </div>
+                                </td>
                                 <td>{formatPlatinum(total)}</td>
                                 <td>{formatTimestamp(row.price?.updatedAt ?? null)}</td>
                                 <td>
                                   <div className="row-actions">
                                     <button
+                                      className={`ghost-button icon-button sale-icon-button${isOnSale ? " is-active" : ""}`}
+                                      type="button"
+                                      onClick={() => toggleSaleMark(entry)}
+                                      aria-pressed={isOnSale}
+                                      aria-label={saleButtonLabel}
+                                      title={saleButtonLabel}
+                                    >
+                                      <SaleIcon />
+                                    </button>
+                                    <button
                                       className="ghost-button icon-button sold-icon-button"
                                       type="button"
-                                      onClick={() => sellOneItem(row.slug)}
-                                      aria-label="Отметить одну штуку как проданную"
-                                      title="Продано: убрать 1 штуку"
+                                      onClick={handleSellRow}
+                                      disabled={!canSellRow}
+                                      aria-label={
+                                        isAssemblableSetRow
+                                          ? "Отметить комплект как проданный"
+                                          : "Отметить одну штуку как проданную"
+                                      }
+                                      title={
+                                        isAssemblableSetRow
+                                          ? "Продано: списать компоненты комплекта"
+                                          : "Продано: убрать 1 штуку"
+                                      }
                                     >
                                       <SoldIcon />
                                     </button>
@@ -3237,6 +5849,16 @@ export default function App() {
                   )}
                 </div>
 
+                {refreshProgress && (
+                  <RefreshProgressBar
+                    label="Прогресс обновления цен"
+                    completed={refreshProgress.completed}
+                    total={refreshProgress.total}
+                    remaining={refreshProgress.remaining}
+                    active={refreshProgress.active}
+                  />
+                )}
+
                 {ducatRows.length === 0 ? (
                   <div className="empty-state">
                     <h3>Нет предметов для обмена</h3>
@@ -3333,7 +5955,7 @@ export default function App() {
                                       <ItemTablePreview item={row} language={language} />
                                       <div className="item-name-cell">
                                         <strong>
-                                          {getLocalizedName(row.names, row.name, language)}
+                                          {getDisplayName(row.names, row.name, language)}
                                         </strong>
                                         <span>{row.slug}</span>
                                         {row.error && (
@@ -3353,13 +5975,13 @@ export default function App() {
                                   <td>{formatTimestamp(row.price?.updatedAt ?? null)}</td>
                                   <td>
                                     <div className="row-actions">
-                                      <button
-                                        className="ghost-button icon-button sold-icon-button"
-                                        type="button"
-                                        onClick={() => sellOneItem(row.slug)}
-                                        aria-label="Отметить одну штуку как проданную"
-                                        title="Продано: убрать 1 штуку"
-                                      >
+                                    <button
+                                      className="ghost-button icon-button sold-icon-button"
+                                      type="button"
+                                      onClick={() => sellOneItem({ row })}
+                                      aria-label="Отметить одну штуку как проданную"
+                                      title="Продано: убрать 1 штуку"
+                                    >
                                         <SoldIcon />
                                       </button>
                                       <button
@@ -3558,7 +6180,7 @@ export default function App() {
                       {visibleMasteryItems.map((entry) => {
                         const { item, sourceIds } = entry;
                         const isMastered = isMasteryEntryMastered(entry, masteryProgress);
-                        const localizedName = getLocalizedName(item.names, item.name, language);
+                        const displayName = getDisplayName(item.names, item.name, language);
 
                         return (
                           <article
@@ -3568,7 +6190,7 @@ export default function App() {
                             <MasteryItemPreview item={item} language={language} />
 
                             <div className="item-card-body mastery-card-body">
-                              <MasteryCardTitle title={localizedName} />
+                              <MasteryCardTitle title={displayName} />
                             </div>
 
                             <div className="mastery-card-footer">
@@ -3657,6 +6279,46 @@ export default function App() {
                         <span className="language-switch-option">RU</span>
                         <span className="language-switch-option">EN</span>
                       </button>
+                    </article>
+
+                    <article className="settings-item">
+                      <div className="settings-copy">
+                        <strong>Имя пользователя на warframe.market</strong>
+                        <p>
+                          Используется, чтобы не учитывать твои собственные лоты в
+                          минимальной продаже и точнее подсвечивать цену при выставлении.
+                        </p>
+                        <label className="settings-field" htmlFor="market-username">
+                          <span>Ник на сайте</span>
+                          <input
+                            id="market-username"
+                            className="search-input settings-text-input"
+                            type="text"
+                            value={marketUsernameInput}
+                            onChange={(event) => setMarketUsernameInput(event.target.value)}
+                            onBlur={(event) => {
+                              const nextUsername = event.currentTarget.value.trim();
+
+                              setMarketUsername(nextUsername);
+                              setMarketUsernameInput(nextUsername);
+                            }}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") {
+                                event.currentTarget.blur();
+                              }
+                            }}
+                            placeholder="Например, TennoTrader"
+                            autoCapitalize="none"
+                            autoComplete="off"
+                            spellCheck={false}
+                          />
+                        </label>
+                        <p className="settings-note">
+                          Сравнение не зависит от регистра. Поле применяется после
+                          выхода из него. Оставь его пустым, если хочешь считать
+                          общий минимум по всем лотам.
+                        </p>
+                      </div>
                     </article>
                   </div>
                 </section>

@@ -13,7 +13,7 @@ const ASSET_BASE = "https://warframe.market/static/assets";
 const ITEM_CACHE_KEY = "wf-prime-tracker:item-catalog:v3";
 const PRICE_CACHE_KEY = "wf-prime-tracker:price-cache:v1";
 const DAY_IN_MS = 24 * 60 * 60 * 1000;
-export const PRICE_CACHE_TTL_MS = 20 * 60 * 1000;
+export const PRICE_CACHE_TTL_MS = 30 * 60 * 1000;
 
 export class PriceFetchError extends Error {
   status: number | null;
@@ -42,6 +42,20 @@ interface OrderPayload {
 
 function isFresh(savedAt: number, ttl: number) {
   return Date.now() - savedAt < ttl;
+}
+
+function normalizeMarketUsername(value: string | null | undefined) {
+  const normalized = value?.trim().toLowerCase() ?? "";
+
+  return normalized.length > 0 ? normalized : null;
+}
+
+function getPriceCacheKey(marketUsername?: string | null) {
+  const normalizedUsername = normalizeMarketUsername(marketUsername);
+
+  return normalizedUsername
+    ? `${PRICE_CACHE_KEY}:market-user:${normalizedUsername}`
+    : PRICE_CACHE_KEY;
 }
 
 function getSnapshotTimestamp(
@@ -197,6 +211,23 @@ function pickOnlineOrders(orders: OrderPayload[]) {
   return online.length > 0 ? online : orders;
 }
 
+function filterOrdersByUsername(
+  orders: OrderPayload[],
+  marketUsername?: string | null,
+) {
+  const normalizedUsername = normalizeMarketUsername(marketUsername);
+
+  if (!normalizedUsername) {
+    return orders;
+  }
+
+  return orders.filter((order) => {
+    const username = order.user?.ingameName?.trim().toLowerCase() ?? "";
+
+    return username.length > 0 && username !== normalizedUsername;
+  });
+}
+
 function minPlatinum(orders: OrderPayload[]) {
   const values = orders
     .map((order) => order.platinum)
@@ -301,10 +332,11 @@ export async function fetchPrimeCatalog(): Promise<MarketItem[]> {
 
 export async function fetchPrimePrice(
   item: Pick<MarketItem, "slug" | "name">,
-  options?: { force?: boolean; signal?: AbortSignal },
+  options?: { force?: boolean; signal?: AbortSignal; marketUsername?: string | null },
 ): Promise<PriceSnapshot> {
+  const cacheKey = getPriceCacheKey(options?.marketUsername);
   const cachedPrices = loadFromStorage<Record<string, CachedValue<PriceSnapshot>>>(
-    PRICE_CACHE_KEY,
+    cacheKey,
     {},
   );
   const cached = cachedPrices[item.slug];
@@ -325,7 +357,9 @@ export async function fetchPrimePrice(
   }
 
   const data = (await response.json()) as unknown;
-  const sellOrders = pickOnlineOrders(extractOrders(data, "sell"));
+  const sellOrders = pickOnlineOrders(
+    filterOrdersByUsername(extractOrders(data, "sell"), options?.marketUsername),
+  );
   const buyOrders = pickOnlineOrders(extractOrders(data, "buy"));
   const now = new Date().toISOString();
 
@@ -342,7 +376,7 @@ export async function fetchPrimePrice(
     lastSuccessAt: now,
   };
 
-  saveToStorage(PRICE_CACHE_KEY, {
+  saveToStorage(cacheKey, {
     ...cachedPrices,
     [item.slug]: {
       value: snapshot,
@@ -353,9 +387,9 @@ export async function fetchPrimePrice(
   return snapshot;
 }
 
-export function loadCachedPriceSnapshots() {
+export function loadCachedPriceSnapshots(marketUsername?: string | null) {
   const cachedPrices = loadFromStorage<Record<string, CachedValue<PriceSnapshot>>>(
-    PRICE_CACHE_KEY,
+    getPriceCacheKey(marketUsername),
     {},
   );
 
