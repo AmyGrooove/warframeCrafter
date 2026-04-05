@@ -126,6 +126,16 @@ corepack enable
 corepack prepare pnpm@latest --activate
 ```
 
+## Docker
+
+Сборка и запуск в контейнере:
+
+```bash
+docker compose up --build
+```
+
+После запуска приложение будет доступно на `http://localhost:8080`.
+
 ## Скрипты
 
 ```bash
