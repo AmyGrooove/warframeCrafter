@@ -64,7 +64,6 @@ type AppSection =
   | "mastery"
   | "settings";
 type MasteryStatusFilter = "all" | "pending" | "mastered";
-type MasteryPrimeFilter = "all" | "prime" | "nonPrime";
 type MasteryGroupFilterId = "all" | MasteryGroupId;
 type PricingMasteryFilter = "all" | "mastered" | "unmastered";
 type SaleRecordType = "item" | "set";
@@ -113,7 +112,7 @@ const APP_SECTIONS: Array<{
   {
     id: "mastery",
     label: "Освоенные предметы",
-    description: "Полный список предметов, которые нужно прокачать для mastery.",
+    description: "Каталог Prime-предметов, которые нужно прокачать для mastery.",
   },
   {
     id: "settings",
@@ -150,15 +149,6 @@ const MASTERY_STATUS_FILTERS: Array<{
   { id: "pending", label: "Не освоено" },
   { id: "mastered", label: "Освоено" },
   { id: "all", label: "Любой статус" },
-];
-
-const MASTERY_PRIME_FILTERS: Array<{
-  id: MasteryPrimeFilter;
-  label: string;
-}> = [
-  { id: "all", label: "Любые" },
-  { id: "prime", label: "Prime" },
-  { id: "nonPrime", label: "Не Prime" },
 ];
 
 const PRICING_MASTERY_FILTERS: Array<{
@@ -2217,7 +2207,6 @@ export default function App() {
     "loading" | "ready" | "error"
   >("loading");
   const [catalogError, setCatalogError] = useState<string | null>(null);
-  const [search, setSearch] = useState("");
   const [inventory, setInventory] = useState<InventoryItem[]>(() =>
     sanitizeStoredInventory(loadFromStorage<InventoryItem[]>(INVENTORY_KEY, [])),
   );
@@ -2268,8 +2257,6 @@ export default function App() {
   const [masteryGroup, setMasteryGroup] = useState<MasteryGroupFilterId>("all");
   const [masteryStatusFilter, setMasteryStatusFilter] =
     useState<MasteryStatusFilter>("pending");
-  const [masteryPrimeFilter, setMasteryPrimeFilter] =
-    useState<MasteryPrimeFilter>("all");
   const [inventoryImportFeedback, setInventoryImportFeedback] =
     useState<ImportFeedback | null>(null);
   const [masteryImportFeedback, setMasteryImportFeedback] =
@@ -2731,7 +2718,7 @@ export default function App() {
 
   useEffect(() => {
     setVisibleMasteryCount(SECTION_RENDER_CHUNK_SIZE);
-  }, [deferredMasterySearch, masteryGroup, masteryPrimeFilter, masteryStatusFilter]);
+  }, [deferredMasterySearch, masteryGroup, masteryStatusFilter]);
 
   useEffect(() => {
     setVisibleInventoryCount(SECTION_RENDER_CHUNK_SIZE);
@@ -3046,7 +3033,7 @@ export default function App() {
   }, [inventory]);
 
   const suggestions = useMemo(() => {
-    const normalizedSearch = search.trim().toLowerCase();
+    const normalizedSearch = inventorySearch.trim().toLowerCase();
 
     if (normalizedSearch.length < 2) {
       return [];
@@ -3081,7 +3068,7 @@ export default function App() {
         ),
       )
       .slice(0, 6);
-  }, [catalog, inventory, language, search]);
+  }, [catalog, inventory, inventorySearch, language]);
 
   const rows = useMemo(
     () => mergeRows(inventory, catalog, priceMap, loadingSlugs, errors),
@@ -3152,13 +3139,17 @@ export default function App() {
     () => groupMasteryCatalogEntries(masteryCatalog),
     [masteryCatalog],
   );
+  const primeMasteryCatalogEntries = useMemo(
+    () => masteryCatalogEntries.filter(({ item }) => isPrimeMasteryItem(item)),
+    [masteryCatalogEntries],
+  );
 
   const masteryTotals = useMemo(() => {
-    const mastered = masteryCatalogEntries.reduce(
+    const mastered = primeMasteryCatalogEntries.reduce(
       (count, entry) => count + (isMasteryEntryMastered(entry, masteryProgress) ? 1 : 0),
       0,
     );
-    const total = masteryCatalogEntries.length;
+    const total = primeMasteryCatalogEntries.length;
 
     return {
       total,
@@ -3166,14 +3157,14 @@ export default function App() {
       remaining: Math.max(total - mastered, 0),
       completionRate: total > 0 ? mastered / total : 0,
     };
-  }, [masteryCatalogEntries, masteryProgress]);
+  }, [masteryProgress, primeMasteryCatalogEntries]);
 
   const masteryGroupStats = useMemo(() => {
     const stats = Object.fromEntries(
       MASTERY_GROUPS.map((group) => [group.id, { total: 0, mastered: 0 }]),
     ) as Record<MasteryGroupId, { total: number; mastered: number }>;
 
-    for (const entry of masteryCatalogEntries) {
+    for (const entry of primeMasteryCatalogEntries) {
       const { item } = entry;
       stats[item.group].total += 1;
 
@@ -3183,17 +3174,16 @@ export default function App() {
     }
 
     return stats;
-  }, [masteryCatalogEntries, masteryProgress]);
+  }, [masteryProgress, primeMasteryCatalogEntries]);
 
   const pricingMasteryLookup = useMemo(() => {
-    return masteryCatalogEntries
-      .filter(({ item }) => isPrimeMasteryItem(item))
+    return primeMasteryCatalogEntries
       .map(({ item, sourceIds }) => ({
         sourceIds,
         normalizedName: normalizeLookupText(item.name),
       }))
       .sort((left, right) => right.normalizedName.length - left.normalizedName.length);
-  }, [masteryCatalogEntries]);
+  }, [primeMasteryCatalogEntries]);
 
   const rowsWithMastery = useMemo(() => {
     return rows.map((row) =>
@@ -3752,7 +3742,7 @@ export default function App() {
   }, [loadingSlugs, priceMap, queuedPriceJobCount, refreshAllTargets]);
 
   const filteredMasteryItems = useMemo(() => {
-    return masteryCatalogEntries
+    return primeMasteryCatalogEntries
       .filter((entry) => {
         const { item } = entry;
 
@@ -3761,21 +3751,12 @@ export default function App() {
         }
 
         const isMastered = isMasteryEntryMastered(entry, masteryProgress);
-        const isPrime = isPrimeMasteryItem(item);
 
         if (masteryStatusFilter === "pending" && isMastered) {
           return false;
         }
 
         if (masteryStatusFilter === "mastered" && !isMastered) {
-          return false;
-        }
-
-        if (masteryPrimeFilter === "prime" && !isPrime) {
-          return false;
-        }
-
-        if (masteryPrimeFilter === "nonPrime" && isPrime) {
           return false;
         }
 
@@ -3812,11 +3793,10 @@ export default function App() {
   }, [
     deferredMasterySearch,
     language,
-    masteryCatalogEntries,
     masteryGroup,
-    masteryPrimeFilter,
     masteryProgress,
     masteryStatusFilter,
+    primeMasteryCatalogEntries,
   ]);
 
   const visibleMasteryItems = useMemo(
@@ -4605,7 +4585,6 @@ export default function App() {
     activePriceRequestsRef.current = 0;
     activeTargetSlugsRef.current = new Set();
     setInventory([]);
-    setSearch("");
     setInventorySearch("");
     setLanguage("ru");
     setMarketUsername("");
@@ -4642,7 +4621,6 @@ export default function App() {
     setMasterySearch("");
     setMasteryGroup("all");
     setMasteryStatusFilter("pending");
-    setMasteryPrimeFilter("all");
     setSaleHistorySearch("");
     setSaleHistoryTypeFilter("all");
     setSaleFormName("");
@@ -4789,17 +4767,20 @@ export default function App() {
                 <div className="section-heading">
                   <div>
                     <h2>Добавить предмет</h2>
-                    <p>Нажми на карточку, чтобы добавить её в свой инвентарь.</p>
+                    <p>
+                      Нажми на карточку, чтобы добавить её в свой инвентарь. Поиск
+                      сверху фильтрует и список добавления, и инвентарь ниже.
+                    </p>
                   </div>
                 </div>
 
                 <div className="search-block">
                   <input
-                    id="item-search"
+                    id="inventory-search"
                     className="search-input"
-                    value={search}
-                    onChange={(event) => setSearch(event.target.value)}
-                    placeholder="Revenant Prime Systems Blueprint"
+                    value={inventorySearch}
+                    onChange={(event) => setInventorySearch(event.target.value)}
+                    placeholder="Поиск по каталогу и инвентарю"
                     autoComplete="off"
                   />
 
@@ -4811,7 +4792,7 @@ export default function App() {
                       {catalogError ?? "Не удалось загрузить каталог."}
                     </p>
                   )}
-                  {search.trim().length >= 2 &&
+                  {inventorySearch.trim().length >= 2 &&
                     suggestions.length === 0 &&
                     catalogState === "ready" && (
                       <p className="state-message">Ничего не найдено.</p>
@@ -4904,22 +4885,6 @@ export default function App() {
 
                 <div className="inventory-tools">
                   <div className="inventory-tools-row">
-                    <div className="inventory-search-field">
-                      <input
-                        id="inventory-owned-search"
-                        className="search-input"
-                        value={inventorySearch}
-                        onChange={(event) => setInventorySearch(event.target.value)}
-                        placeholder={
-                          isCraftableSetInventoryView
-                            ? "Поиск по доступным комплектам"
-                            : isMissingSetInventoryView
-                              ? "Поиск по недостающим комплектам"
-                            : "Поиск по моему инвентарю"
-                        }
-                        autoComplete="off"
-                      />
-                    </div>
                     <div className="inventory-switches">
                       <button
                         className={`inventory-switch${isCraftableSetInventoryView ? " is-active" : ""}`}
@@ -6065,10 +6030,10 @@ export default function App() {
               <section className="panel mastery-panel">
                 <div className="section-heading section-heading-row">
                   <div>
-                    <h2>Каталог mastery-предметов</h2>
+                    <h2>Каталог Prime mastery-предметов</h2>
                     <p>
-                      Отмечай всё, что уже прокачано. Прогресс сохраняется локально
-                      в браузере.
+                      Здесь отображаются только Prime-предметы. Прогресс
+                      сохраняется локально в браузере.
                     </p>
                   </div>
                   <div className="section-heading-actions">
@@ -6093,7 +6058,7 @@ export default function App() {
                     className="search-input"
                     value={masterySearch}
                     onChange={(event) => setMasterySearch(event.target.value)}
-                    placeholder="Excalibur, Carrier Prime, Catchmoon..."
+                    placeholder="Carrier Prime, Burston Prime, Lex Prime..."
                     autoComplete="off"
                   />
 
@@ -6104,19 +6069,6 @@ export default function App() {
                         className={`filter-chip${masteryStatusFilter === filter.id ? " is-active" : ""}`}
                         type="button"
                         onClick={() => setMasteryStatusFilter(filter.id)}
-                      >
-                        {filter.label}
-                      </button>
-                    ))}
-                  </div>
-
-                  <div className="filter-row" aria-label="Фильтр по Prime">
-                    {MASTERY_PRIME_FILTERS.map((filter) => (
-                      <button
-                        key={filter.id}
-                        className={`filter-chip${masteryPrimeFilter === filter.id ? " is-active" : ""}`}
-                        type="button"
-                        onClick={() => setMasteryPrimeFilter(filter.id)}
                       >
                         {filter.label}
                       </button>
@@ -6148,7 +6100,7 @@ export default function App() {
                 {masteryCatalogState === "loading" || masteryCatalogState === "idle" ? (
                   <div className="empty-state">
                     <h3>Загружаю каталог</h3>
-                    <p>Подтягиваю список всех предметов для освоения.</p>
+                    <p>Подтягиваю список всех Prime-предметов для освоения.</p>
                   </div>
                 ) : masteryCatalogState === "error" ? (
                   <div className="empty-state">
