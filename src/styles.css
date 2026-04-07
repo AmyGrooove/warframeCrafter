@@ -1246,6 +1246,10 @@ button {
   margin-top: 12px;
 }
 
+.settings-panel {
+  padding: 16px;
+}
+
 .settings-groups {
   display: grid;
   gap: 18px;
@@ -1301,6 +1305,19 @@ button {
   background: #111720;
 }
 
+.settings-item-stacked {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.settings-item-stacked .settings-actions {
+  justify-content: flex-start;
+}
+
+.settings-item.is-disabled {
+  opacity: 0.72;
+}
+
 .settings-copy strong {
   display: block;
   font-size: 0.96rem;
@@ -1324,6 +1341,79 @@ button {
   color: #95a1b2;
   font-size: 0.84rem;
   font-weight: 600;
+}
+
+.settings-import-switch {
+  position: relative;
+  display: inline-grid;
+  grid-template-columns: 1fr 1fr;
+  align-items: center;
+  width: 100%;
+  min-width: 0;
+  border: 1px solid #2b3442;
+  border-radius: 12px;
+  padding: 4px;
+  background: #0f141c;
+  color: #edf2f7;
+  font-size: 0.84rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  overflow: hidden;
+}
+
+.settings-import-switch:hover {
+  border-color: #3a4556;
+  background: #18202b;
+}
+
+.settings-import-switch:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.settings-import-switch:disabled:hover {
+  border-color: #2b3442;
+  background: #0f141c;
+}
+
+.settings-import-switch-thumb {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  width: calc(50% - 4px);
+  height: calc(100% - 8px);
+  border-radius: 8px;
+  background: #1d2733;
+  transition: transform 140ms ease;
+}
+
+.settings-import-switch.is-replace .settings-import-switch-thumb {
+  transform: translateX(100%);
+}
+
+.settings-import-switch:disabled .settings-import-switch-thumb {
+  background: #202a38;
+}
+
+.settings-import-switch-option {
+  position: relative;
+  z-index: 1;
+  padding: 6px 10px;
+  color: #95a1b2;
+  text-align: center;
+}
+
+.settings-import-switch.is-append .settings-import-switch-option:first-of-type,
+.settings-import-switch.is-replace .settings-import-switch-option:last-of-type {
+  color: #edf2f7;
+}
+
+.settings-import-switch:disabled .settings-import-switch-option {
+  color: #7f8b9b;
+}
+
+.settings-import-switch:disabled .settings-import-switch-option:first-of-type {
+  color: #95a1b2;
 }
 
 .settings-text-input {
@@ -1358,6 +1448,51 @@ button {
 
 .settings-status.is-success {
   color: #8fd3b5;
+}
+
+.settings-import-issues {
+  display: grid;
+  gap: 10px;
+  margin-top: 8px;
+  padding-top: 12px;
+  border-top: 1px solid #232f3d;
+}
+
+.settings-import-issues-header {
+  display: grid;
+  gap: 4px;
+}
+
+.settings-import-issues-list {
+  display: grid;
+  gap: 8px;
+  max-height: 280px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  overflow: auto;
+}
+
+.settings-import-issue {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid #232f3d;
+  border-radius: 12px;
+  background: #0e141c;
+}
+
+.settings-import-issue span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-import-issue strong {
+  flex-shrink: 0;
 }
 
 .file-input-hidden {
@@ -1725,10 +1860,6 @@ button {
 
   .summary-grid {
     grid-template-columns: 1fr 1fr;
-  }
-
-  .settings-group {
-    padding: 14px;
   }
 
   .settings-item {

@@ -43,6 +43,8 @@ import type {
 const INVENTORY_KEY = "wf-prime-tracker:inventory:v1";
 const LANGUAGE_KEY = "wf-prime-tracker:language:v1";
 const MARKET_USERNAME_KEY = "wf-prime-tracker:market-username:v1";
+const INVENTORY_IMAGE_IMPORT_MODE_KEY =
+  "wf-prime-tracker:inventory-image-import-mode:v1";
 const MASTERY_PROGRESS_KEY = "wf-prime-tracker:mastery-progress:v1";
 const PRICE_REQUEST_META_KEY = "wf-prime-tracker:price-request-meta:v1";
 const SALE_MARKS_KEY = "wf-prime-tracker:sale-marks:v1";
@@ -55,6 +57,7 @@ const PRICE_QUEUE_DELAY_MS = 180;
 const PRICE_GENERAL_RETRY_MS = 60 * 1000;
 const PRICE_ERROR_COOLDOWN_MS = 7 * 60 * 1000;
 const SECTION_RENDER_CHUNK_SIZE = 48;
+const INVENTORY_IMAGE_IMPORT_DISABLED = true;
 
 type AppSection =
   | "inventory"
@@ -81,6 +84,11 @@ type DucatSortKey =
   | "minSellPrice"
   | "ducatsPerPlatinum"
   | "updatedAt";
+type InventoryImageImportMode = "append" | "replace";
+
+function isInventoryImageImportMode(value: unknown): value is InventoryImageImportMode {
+  return value === "append" || value === "replace";
+}
 
 const APP_SECTIONS: Array<{
   id: AppSection;
@@ -251,6 +259,16 @@ interface SoldRecord {
 }
 
 interface InventoryImportEntry {
+  name: string;
+  count: number;
+}
+
+interface ImportedInventoryMatch {
+  item: MarketItem;
+  quantity: number;
+}
+
+interface InventoryImageIssue {
   name: string;
   count: number;
 }
@@ -877,6 +895,67 @@ function normalizeImportName(value: string) {
     .trim();
 }
 
+function normalizeImportSearchName(value: string) {
+  return normalizeImportName(value)
+    .replace(/\bчерт(?:еж)?\b/g, " ")
+    .replace(/\bпрайм\b/g, " ")
+    .replace(/\bprime\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getEditDistance(left: string, right: string) {
+  if (left === right) {
+    return 0;
+  }
+
+  if (left.length === 0) {
+    return right.length;
+  }
+
+  if (right.length === 0) {
+    return left.length;
+  }
+
+  const previousRow = Array.from({ length: right.length + 1 }, (_, index) => index);
+  const currentRow = new Array<number>(right.length + 1).fill(0);
+
+  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+    currentRow[0] = leftIndex;
+
+    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+      const substitutionCost =
+        left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1;
+
+      currentRow[rightIndex] = Math.min(
+        previousRow[rightIndex] + 1,
+        currentRow[rightIndex - 1] + 1,
+        previousRow[rightIndex - 1] + substitutionCost,
+      );
+    }
+
+    for (let rightIndex = 0; rightIndex <= right.length; rightIndex += 1) {
+      previousRow[rightIndex] = currentRow[rightIndex];
+    }
+  }
+
+  return previousRow[right.length];
+}
+
+function getTextSimilarity(left: string, right: string) {
+  if (!left || !right) {
+    return 0;
+  }
+
+  const maxLength = Math.max(left.length, right.length);
+
+  if (maxLength === 0) {
+    return 1;
+  }
+
+  return 1 - getEditDistance(left, right) / maxLength;
+}
+
 function isPrimeSetName(value: string | undefined) {
   return typeof value === "string" && /\s+set$/i.test(value.trim());
 }
@@ -1316,6 +1395,96 @@ function buildCatalogItemLookup(items: MarketItem[]) {
   return lookup;
 }
 
+interface InventoryImageImportResult {
+  items: InventoryItem[];
+  removedItems: InventoryItem[];
+  addedCount: number;
+  updatedCount: number;
+}
+
+function buildInventoryImageImportResult(
+  current: InventoryItem[],
+  imported: Map<string, ImportedInventoryMatch>,
+  mode: InventoryImageImportMode,
+): InventoryImageImportResult {
+  const items = [...imported.values()].map(({ item, quantity }) => {
+    return {
+      slug: item.slug,
+      name: item.name,
+      names: item.names,
+      assets: item.assets,
+      ducats: item.ducats,
+      quantity,
+    };
+  });
+  const currentMap = new Map(current.map((item) => [item.slug, item]));
+
+  if (mode === "replace") {
+    const importedSlugs = new Set(items.map((item) => item.slug));
+    let addedCount = 0;
+    let updatedCount = 0;
+
+    for (const item of items) {
+      const existing = currentMap.get(item.slug);
+
+      if (!existing) {
+        addedCount += 1;
+      } else if (existing.quantity !== item.quantity) {
+        updatedCount += 1;
+      }
+    }
+
+    const removedItems = current.filter((item) => !importedSlugs.has(item.slug));
+
+    return {
+      items,
+      removedItems,
+      addedCount,
+      updatedCount,
+    };
+  }
+
+  const mergedItems = current.map((item) => {
+    const importedItem = imported.get(item.slug);
+
+    if (!importedItem) {
+      return item;
+    }
+
+    const nextQuantity = Math.max(item.quantity, importedItem.quantity);
+
+    return {
+      ...item,
+      ...importedItem.item,
+      quantity: nextQuantity,
+    };
+  });
+
+  let addedCount = 0;
+  let updatedCount = 0;
+
+  for (const item of items) {
+    const existing = currentMap.get(item.slug);
+
+    if (!existing) {
+      addedCount += 1;
+      mergedItems.push(item);
+      continue;
+    }
+
+    if (item.quantity > existing.quantity) {
+      updatedCount += 1;
+    }
+  }
+
+  return {
+    items: mergedItems,
+    removedItems: [],
+    addedCount,
+    updatedCount,
+  };
+}
+
 function getCatalogItemLookupCandidates(value: string) {
   const normalized = normalizeImportName(value);
 
@@ -1346,12 +1515,15 @@ function resolveCatalogItemLike(
   }
 
   const normalizedQuery = normalizeImportName(value);
+  const searchableQuery = normalizeImportSearchName(value);
 
-  if (!normalizedQuery) {
+  if (!normalizedQuery && !searchableQuery) {
     return null;
   }
 
-  const normalizedQueryTerms = normalizedQuery.split(" ").filter(Boolean);
+  const normalizedQueryTerms = (searchableQuery || normalizedQuery)
+    .split(" ")
+    .filter(Boolean);
   let bestItem: MarketItem | null = null;
   let bestScore = 0;
 
@@ -1366,31 +1538,53 @@ function resolveCatalogItemLike(
 
     for (const candidate of itemCandidates) {
       const normalizedCandidate = normalizeImportName(candidate);
+      const searchableCandidate = normalizeImportSearchName(candidate);
 
-      if (!normalizedCandidate) {
+      if (!normalizedCandidate && !searchableCandidate) {
         continue;
       }
 
-      if (normalizedCandidate === normalizedQuery) {
+      if (
+        (normalizedCandidate && normalizedCandidate === normalizedQuery) ||
+        (searchableCandidate && searchableCandidate === searchableQuery)
+      ) {
         return item;
       }
 
       let score = 0;
+      const primaryCandidate = searchableCandidate || normalizedCandidate;
+      const primaryQuery = searchableQuery || normalizedQuery;
 
-      if (normalizedCandidate.startsWith(normalizedQuery)) {
-        score = Math.max(score, 100 - (normalizedCandidate.length - normalizedQuery.length));
+      if (primaryCandidate && primaryCandidate.startsWith(primaryQuery)) {
+        score = Math.max(score, 100 - (primaryCandidate.length - primaryQuery.length));
       }
 
-      if (normalizedQuery.startsWith(normalizedCandidate)) {
-        score = Math.max(score, 90 - (normalizedQuery.length - normalizedCandidate.length));
+      if (primaryCandidate && primaryQuery.startsWith(primaryCandidate)) {
+        score = Math.max(score, 90 - (primaryQuery.length - primaryCandidate.length));
       }
 
       const queryMatchCount = normalizedQueryTerms.filter((term) =>
-        normalizedCandidate.includes(term),
+        (primaryCandidate ?? normalizedCandidate).includes(term),
       ).length;
 
       if (queryMatchCount > 0) {
         score = Math.max(score, queryMatchCount * 10);
+      }
+
+      if (primaryCandidate && primaryQuery) {
+        const similarity = getTextSimilarity(primaryCandidate, primaryQuery);
+
+        if (similarity >= 0.68) {
+          score = Math.max(score, Math.round(similarity * 100));
+        }
+      }
+
+      if (normalizedCandidate && normalizedQuery) {
+        const rawSimilarity = getTextSimilarity(normalizedCandidate, normalizedQuery);
+
+        if (rawSimilarity >= 0.7) {
+          score = Math.max(score, Math.round(rawSimilarity * 90));
+        }
       }
 
       if (score > bestScore) {
@@ -2261,8 +2455,24 @@ export default function App() {
     useState<ImportFeedback | null>(null);
   const [masteryImportFeedback, setMasteryImportFeedback] =
     useState<ImportFeedback | null>(null);
+  const [inventoryImageImportFeedback, setInventoryImageImportFeedback] =
+    useState<ImportFeedback | null>(null);
+  const [inventoryImageImportIssues, setInventoryImageImportIssues] = useState<
+    InventoryImageIssue[]
+  >([]);
+  const [inventoryImageImportMode, setInventoryImageImportMode] =
+    useState<InventoryImageImportMode>(() => {
+      const storedMode = loadFromStorage<unknown>(
+        INVENTORY_IMAGE_IMPORT_MODE_KEY,
+        "append",
+      );
+
+      return isInventoryImageImportMode(storedMode) ? storedMode : "append";
+    });
   const [saleHistoryFeedback, setSaleHistoryFeedback] =
     useState<ImportFeedback | null>(null);
+  const [isInventoryImageImporting, setIsInventoryImageImporting] =
+    useState(false);
   const [masteryProgress, setMasteryProgress] = useState<Record<string, boolean>>(
     () => loadFromStorage<Record<string, boolean>>(MASTERY_PROGRESS_KEY, {}),
   );
@@ -2317,6 +2527,7 @@ export default function App() {
   const pricingLoadMoreRef = useRef<HTMLDivElement | null>(null);
   const ducatsLoadMoreRef = useRef<HTMLDivElement | null>(null);
   const inventoryImportInputRef = useRef<HTMLInputElement | null>(null);
+  const inventoryImageImportInputRef = useRef<HTMLInputElement | null>(null);
   const masteryImportInputRef = useRef<HTMLInputElement | null>(null);
   const isMountedRef = useRef(true);
   const marketUsernameLoadedRef = useRef(false);
@@ -2412,6 +2623,10 @@ export default function App() {
   useEffect(() => {
     saveToStorage(LANGUAGE_KEY, language);
   }, [language]);
+
+  useEffect(() => {
+    saveToStorage(INVENTORY_IMAGE_IMPORT_MODE_KEY, inventoryImageImportMode);
+  }, [inventoryImageImportMode]);
 
   useEffect(() => {
     saveToStorage(MARKET_USERNAME_KEY, marketUsername);
@@ -4409,6 +4624,181 @@ export default function App() {
     }
   }
 
+  async function handleInventoryImageImportChange(
+    event: ChangeEvent<HTMLInputElement>,
+  ) {
+    const input = event.currentTarget;
+    const files = Array.from(input.files ?? []);
+    input.value = "";
+
+    if (files.length === 0) {
+      return;
+    }
+
+    setInventoryImageImportFeedback(null);
+    setInventoryImageImportIssues([]);
+
+    if (catalogState !== "ready" || catalogImportLookup.size === 0) {
+      setInventoryImageImportFeedback({
+        tone: "error",
+        message:
+          "Каталог прайм-предметов ещё не загружен. Повтори импорт через пару секунд.",
+      });
+      return;
+    }
+
+    setIsInventoryImageImporting(true);
+
+    try {
+      const { parseInventoryImageFile } = await import("./lib/inventoryImageParser");
+      const importedItems = new Map<string, ImportedInventoryMatch>();
+      const unresolvedItems = new Map<string, InventoryImageIssue>();
+      const failedFiles = new Set<string>();
+      let parsedTileCount = 0;
+
+      for (const [index, file] of files.entries()) {
+        setInventoryImageImportFeedback({
+          tone: "success",
+          message: `Обрабатываю ${index + 1} из ${files.length}: ${file.name}...`,
+        });
+
+        try {
+          const parsedEntries = await parseInventoryImageFile(file);
+          parsedTileCount += parsedEntries.length;
+
+          for (const entry of parsedEntries) {
+            const quantity = Math.max(1, Math.round(entry.count));
+            const normalizedName = normalizeImportName(entry.name);
+            const trimmedName = entry.name.trim();
+
+            if (!normalizedName) {
+              const issueKey =
+                trimmedName.toLowerCase() || `issue-${unresolvedItems.size}`;
+              const existingIssue = unresolvedItems.get(issueKey);
+
+              unresolvedItems.set(issueKey, {
+                name: existingIssue?.name ?? (trimmedName || "Неизвестно"),
+                count: Math.max(existingIssue?.count ?? 0, quantity),
+              });
+              continue;
+            }
+
+            const matchedItem = resolveCatalogItemLike(
+              catalog,
+              catalogImportLookup,
+              entry.name,
+              {
+                includeSets: false,
+              },
+            );
+
+            if (!matchedItem) {
+              const existingIssue = unresolvedItems.get(normalizedName);
+
+              unresolvedItems.set(normalizedName, {
+                name: existingIssue?.name ?? (trimmedName || normalizedName),
+                count: Math.max(existingIssue?.count ?? 0, quantity),
+              });
+              continue;
+            }
+
+            const existing = importedItems.get(matchedItem.slug);
+
+            importedItems.set(matchedItem.slug, {
+              item: matchedItem,
+              quantity: existing ? Math.max(existing.quantity, quantity) : quantity,
+            });
+          }
+        } catch (error) {
+          failedFiles.add(file.name);
+        }
+      }
+
+      const unresolvedList = [...unresolvedItems.values()].sort((left, right) =>
+        normalizeImportName(left.name).localeCompare(normalizeImportName(right.name)),
+      );
+      setInventoryImageImportIssues(unresolvedList);
+
+      if (importedItems.size === 0) {
+        const failedFileNames = [...failedFiles];
+        const failedSuffix =
+          failedFileNames.length > 0
+            ? ` Не удалось прочитать: ${failedFileNames.slice(0, 4).join(", ")}${
+                failedFileNames.length > 4 ? ` и ещё ${failedFileNames.length - 4}` : ""
+              }.`
+            : "";
+        const unresolvedSuffix =
+          unresolvedList.length > 0
+            ? summarizeMissingNames(unresolvedList.map((item) => item.name))
+            : "";
+
+        if (failedFiles.size > 0) {
+          throw new Error(
+            `Не удалось распознать ни одного изображения.${unresolvedSuffix}${failedSuffix}`,
+          );
+        }
+
+        throw new Error(
+          `Не удалось сопоставить ни одного предмета с каталогом.${unresolvedSuffix}${failedSuffix}`,
+        );
+      }
+
+      const importResult = buildInventoryImageImportResult(
+        inventory,
+        importedItems,
+        inventoryImageImportMode,
+      );
+      const removedSlugs = importResult.removedItems.map((item) => item.slug);
+
+      for (const slug of removedSlugs) {
+        clearItemState(slug);
+      }
+
+      setInventory(importResult.items);
+
+      const failedFileNames = [...failedFiles];
+      const failedSuffix =
+        failedFileNames.length > 0
+          ? ` Не удалось прочитать: ${failedFileNames.slice(0, 4).join(", ")}${
+              failedFileNames.length > 4 ? ` и ещё ${failedFileNames.length - 4}` : ""
+            }.`
+          : "";
+      const issueSuffix =
+        unresolvedList.length > 0 ? ` Спорных строк: ${unresolvedList.length}.` : "";
+      const parsedSuffix =
+        parsedTileCount > 0 ? ` Распознано плиток: ${parsedTileCount}.` : "";
+      const summaryPrefix =
+        inventoryImageImportMode === "append"
+          ? "Инвентарь дополнен по картинкам"
+          : "Инвентарь заменён по картинкам";
+      const changeSuffix =
+        inventoryImageImportMode === "append"
+          ? importResult.addedCount === 0 && importResult.updatedCount === 0
+            ? " Инвентарь уже содержит все предметы со скриншотов."
+            : ` Добавлено ${importResult.addedCount} новых позиций${
+                importResult.updatedCount > 0
+                  ? `, обновлено ${importResult.updatedCount} существующих`
+                  : ""
+              }.`
+          : ` Импортировано ${importResult.items.length} позиций. Удалено ${removedSlugs.length} старых позиций.`;
+
+      setInventoryImageImportFeedback({
+        tone: "success",
+        message: `${summaryPrefix}.${changeSuffix}${parsedSuffix}${issueSuffix}${failedSuffix}`,
+      });
+    } catch (error) {
+      setInventoryImageImportFeedback({
+        tone: "error",
+        message:
+          error instanceof Error
+            ? error.message
+            : "Не удалось прочитать изображения инвентаря.",
+      });
+    } finally {
+      setIsInventoryImageImporting(false);
+    }
+  }
+
   async function handleMasteryImportChange(event: ChangeEvent<HTMLInputElement>) {
     const input = event.currentTarget;
     const file = input.files?.[0];
@@ -4593,6 +4983,8 @@ export default function App() {
     setWikiPageState("idle");
     setWikiPageError(null);
     setInventoryImportFeedback(null);
+    setInventoryImageImportFeedback(null);
+    setInventoryImageImportIssues([]);
     setMasteryImportFeedback(null);
     setSaleHistoryFeedback(null);
     setPriceMap({});
@@ -4609,6 +5001,7 @@ export default function App() {
     setIsBulkRefreshing(false);
     setIsAutoPriceRefreshPaused(false);
     setIsRefreshAllButtonHovered(false);
+    setIsInventoryImageImporting(false);
     setInventoryMasteryFilter("all");
     setPricingMasteryFilter("mastered");
     setDucatsMasteryFilter("mastered");
@@ -6199,7 +6592,7 @@ export default function App() {
               </section>
             </>
           ) : (
-            <section className="panel settings-panel">
+            <section className="settings-panel">
               <div className="settings-groups">
                 <section className="settings-group">
                   <div className="settings-group-header">
@@ -6271,6 +6664,140 @@ export default function App() {
                           общий минимум по всем лотам.
                         </p>
                       </div>
+                    </article>
+                  </div>
+                </section>
+
+                <section className="settings-group">
+                  <div className="settings-group-header">
+                    <h2>Импорт из скриншотов</h2>
+                    <p>
+                      Загружай один или несколько скриншотов инвентаря.
+                      Переключатель ниже определяет, дополнять ли инвентарь или
+                      полностью заменять его данными со скриншотов.
+                    </p>
+                  </div>
+
+                  <div className="settings-list">
+                    <article
+                      className={`settings-item settings-item-stacked${INVENTORY_IMAGE_IMPORT_DISABLED ? " is-disabled" : ""}`}
+                    >
+                      <div className="settings-copy">
+                        <strong>Импорт инвентаря по изображениям</strong>
+                        <p>
+                          Имя читается снизу плитки, количество - сверху слева.
+                          Нераспознанные строки показываются ниже и не попадают в
+                          инвентарь.
+                        </p>
+                        <p className="settings-note">
+                          Можно выбрать сразу несколько файлов. Первый запуск
+                          OCR может занять немного времени.
+                        </p>
+                        <div className="settings-field">
+                          <span>Режим импорта</span>
+                          <button
+                            className={`settings-import-switch ${inventoryImageImportMode === "append" ? "is-append" : "is-replace"}`}
+                            type="button"
+                            aria-label="Переключить режим импорта из скриншотов"
+                            role="switch"
+                            aria-checked={inventoryImageImportMode === "replace"}
+                            disabled={INVENTORY_IMAGE_IMPORT_DISABLED}
+                            onClick={() =>
+                              setInventoryImageImportMode((current) =>
+                                current === "append" ? "replace" : "append",
+                              )
+                            }
+                          >
+                            <span
+                              className="settings-import-switch-thumb"
+                              aria-hidden="true"
+                            />
+                            <span className="settings-import-switch-option">
+                              Дополнять
+                            </span>
+                            <span className="settings-import-switch-option">
+                              Заменять
+                            </span>
+                          </button>
+                        </div>
+                        <p className="settings-note">
+                          По умолчанию включено дополнение: новые предметы
+                          добавляются, а уже имеющиеся не удаляются. В режиме
+                          замены инвентарь полностью синхронизируется со
+                          скриншотами.
+                        </p>
+                        <p className="settings-status is-error">
+                          Импорт из скриншотов временно отключён. Блок оставлен
+                          в настройках, но сейчас неактивен.
+                        </p>
+                      </div>
+
+                      <div className="settings-actions">
+                        <input
+                          ref={inventoryImageImportInputRef}
+                          className="file-input-hidden"
+                          type="file"
+                          accept="image/*"
+                          multiple
+                          disabled={INVENTORY_IMAGE_IMPORT_DISABLED}
+                          onChange={handleInventoryImageImportChange}
+                        />
+                        <button
+                          className="ghost-button"
+                          type="button"
+                          onClick={() => {
+                            setInventoryImageImportFeedback(null);
+                            setInventoryImageImportIssues([]);
+                            inventoryImageImportInputRef.current?.click();
+                          }}
+                          disabled={
+                            INVENTORY_IMAGE_IMPORT_DISABLED ||
+                            catalogState !== "ready" ||
+                            isInventoryImageImporting
+                          }
+                        >
+                          {INVENTORY_IMAGE_IMPORT_DISABLED
+                            ? "Отключено"
+                            : isInventoryImageImporting
+                              ? "Распознаю..."
+                              : "Импорт изображений"}
+                        </button>
+                      </div>
+
+                      {!INVENTORY_IMAGE_IMPORT_DISABLED &&
+                        inventoryImageImportFeedback && (
+                          <p
+                            className={`settings-status${inventoryImageImportFeedback.tone === "error" ? " is-error" : " is-success"}`}
+                          >
+                            {inventoryImageImportFeedback.message}
+                          </p>
+                        )}
+
+                      {!INVENTORY_IMAGE_IMPORT_DISABLED &&
+                        inventoryImageImportIssues.length > 0 && (
+                          <div className="settings-import-issues">
+                            <div className="settings-import-issues-header">
+                              <strong>Спорные предметы</strong>
+                              <p className="settings-note">
+                                Не удалось сопоставить их с каталогом. Они не
+                                попадут в инвентарь, пока не будут распознаны
+                                точно.
+                              </p>
+                            </div>
+
+                            <ul className="settings-import-issues-list">
+                              {inventoryImageImportIssues.map((issue) => (
+                                <li
+                                  key={`${issue.name}-${issue.count}`}
+                                  className="settings-import-issue"
+                                >
+                                  <span title={issue.name}>{issue.name}</span>
+                                  <strong>×{issue.count}</strong>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
                     </article>
                   </div>
                 </section>
