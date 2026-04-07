@@ -4958,6 +4958,34 @@ export default function App() {
     return ducatSort.direction === "desc" ? " v" : " ^";
   }
 
+  function clearMasteryProgress() {
+    const confirmed = window.confirm(
+      "Очистить все освоенные предметы? Отметки mastery будут сброшены для всего каталога.",
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    setMasteryProgress({});
+    setMasteryImportFeedback(null);
+  }
+
+  function clearInventoryOnly() {
+    const confirmed = window.confirm(
+      "Очистить весь инвентарь? Все предметы будут удалены из списка, а связанные с ними локальные данные будут сброшены.",
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    setInventory([]);
+    setInventoryImportFeedback(null);
+    setInventoryImageImportFeedback(null);
+    setInventoryImageImportIssues([]);
+  }
+
   function clearAllData() {
     const confirmed = window.confirm(
       "Очистить весь инвентарь, историю продаж, прогресс освоения, фильтры, настройки языка и локальные кеши приложения?",
@@ -6966,6 +6994,41 @@ export default function App() {
                   </div>
 
                   <div className="settings-list">
+                    <article className="settings-item">
+                      <div className="settings-copy">
+                        <strong>Очистить освоенные предметы</strong>
+                        <p>
+                          Сбрасывает отметки mastery для всех предметов в каталоге.
+                        </p>
+                      </div>
+
+                      <button
+                        className="danger-button"
+                        type="button"
+                        onClick={clearMasteryProgress}
+                      >
+                        Очистить освоенные
+                      </button>
+                    </article>
+
+                    <article className="settings-item">
+                      <div className="settings-copy">
+                        <strong>Очистить весь инвентарь</strong>
+                        <p>
+                          Удаляет все предметы из инвентаря и очищает связанные с ними локальные
+                          данные.
+                        </p>
+                      </div>
+
+                      <button
+                        className="danger-button"
+                        type="button"
+                        onClick={clearInventoryOnly}
+                      >
+                        Очистить инвентарь
+                      </button>
+                    </article>
+
                     <article className="settings-item">
                       <div className="settings-copy">
                         <strong>Очистить все данные</strong>
