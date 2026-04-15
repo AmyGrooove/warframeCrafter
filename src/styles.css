@@ -1071,6 +1071,127 @@ button {
   flex-wrap: wrap;
 }
 
+.inventory-toolbar {
+  gap: 12px;
+  width: 100%;
+}
+
+.inventory-toolbar-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+}
+
+.inventory-toolbar-row .pricing-filter-row {
+  min-width: 0;
+}
+
+.inventory-sort-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  height: 43px;
+  min-height: 43px;
+  border: 1px solid #2b3442;
+  border-radius: 16px;
+  padding: 0 12px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.03), transparent 120px),
+    #111720;
+  color: inherit;
+  text-align: left;
+  white-space: nowrap;
+  justify-self: end;
+}
+
+.inventory-sort-control:hover {
+  border-color: #3a4556;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent 120px),
+    #18202b;
+}
+
+.inventory-sort-control.is-active {
+  border-color: #3a5466;
+  background:
+    linear-gradient(180deg, rgba(242, 161, 74, 0.08), transparent 120px),
+    #1a2530;
+}
+
+.inventory-sort-control-icon {
+  display: grid;
+  justify-items: center;
+  gap: 2px;
+  width: 18px;
+  flex: 0 0 auto;
+}
+
+.inventory-sort-control-icon span {
+  display: block;
+}
+
+.inventory-sort-control-icon span:first-child,
+.inventory-sort-control-icon span:last-child {
+  width: 0;
+  height: 0;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+}
+
+.inventory-sort-control-icon span:first-child {
+  border-bottom: 7px solid #95a1b2;
+}
+
+.inventory-sort-control-icon span:nth-child(2) {
+  width: 16px;
+  height: 2px;
+  border-radius: 999px;
+  background: #95a1b2;
+}
+
+.inventory-sort-control-icon span:last-child {
+  border-top: 7px solid #95a1b2;
+}
+
+.inventory-sort-control.is-active .inventory-sort-control-icon span:first-child {
+  border-bottom-color: #f2a14a;
+}
+
+.inventory-sort-control.is-active .inventory-sort-control-icon span:nth-child(2) {
+  background: #f2a14a;
+}
+
+.inventory-sort-control.is-active .inventory-sort-control-icon span:last-child {
+  border-top-color: #f2a14a;
+}
+
+.inventory-sort-control-copy {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.inventory-sort-control-copy strong {
+  display: block;
+  font-size: 0.88rem;
+  line-height: 1;
+}
+
+.inventory-sort-control-copy span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 46px;
+  padding: 4px 8px;
+  border: 1px solid #2b3442;
+  border-radius: 999px;
+  color: #95a1b2;
+  font-size: 0.74rem;
+  line-height: 1;
+}
+
 .assemblable-set-footer {
   display: grid;
   gap: 10px;
@@ -1829,6 +1950,15 @@ button {
   .pricing-toolbar {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .inventory-toolbar-row {
+    grid-template-columns: 1fr;
+  }
+
+  .inventory-sort-control {
+    width: 100%;
+    justify-self: stretch;
   }
 
   .sale-form-grid {

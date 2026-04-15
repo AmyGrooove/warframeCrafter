@@ -84,6 +84,8 @@ type DucatSortKey =
   | "minSellPrice"
   | "ducatsPerPlatinum"
   | "updatedAt";
+type InventorySortDirection = "asc" | "desc";
+type InventorySortState = InventorySortDirection | null;
 type InventoryImageImportMode = "append" | "replace";
 
 function isInventoryImageImportMode(value: unknown): value is InventoryImageImportMode {
@@ -2500,6 +2502,8 @@ export default function App() {
   const [pricingShowOnSaleOnly, setPricingShowOnSaleOnly] = useState(false);
   const [inventoryMasteryFilter, setInventoryMasteryFilter] =
     useState<PricingMasteryFilter>("all");
+  const [inventorySort, setInventorySort] =
+    useState<InventorySortState>(null);
   const [pricingMasteryFilter, setPricingMasteryFilter] =
     useState<PricingMasteryFilter>("mastered");
   const [ducatsMasteryFilter, setDucatsMasteryFilter] =
@@ -3520,7 +3524,7 @@ export default function App() {
   }, [inventory, wikiPageState, wikiSetRows]);
 
   const inventoryRows = useMemo(() => {
-    return inventorySourceRows.filter((entry) => {
+    const filteredRows = inventorySourceRows.filter((entry) => {
       if (!matchesInventorySearch(entry.row, deferredInventorySearch)) {
         return false;
       }
@@ -3539,7 +3543,30 @@ export default function App() {
 
       return !entry.masteryStatus;
     });
-  }, [deferredInventorySearch, inventoryMasteryFilter, inventorySourceRows]);
+    if (!inventorySort) {
+      return filteredRows;
+    }
+
+    const collator = new Intl.Collator(language, { numeric: true });
+
+    return [...filteredRows].sort((left, right) => {
+      const leftName = getDisplayName(left.row.names, left.row.name, language);
+      const rightName = getDisplayName(right.row.names, right.row.name, language);
+      const comparison = collator.compare(leftName, rightName);
+
+      if (comparison !== 0) {
+        return inventorySort === "asc" ? comparison : -comparison;
+      }
+
+      return collator.compare(left.row.slug, right.row.slug);
+    });
+  }, [
+    deferredInventorySearch,
+    inventoryMasteryFilter,
+    inventorySourceRows,
+    inventorySort,
+    language,
+  ]);
   const visibleInventoryRows = useMemo(
     () => inventoryRows.slice(0, visibleInventoryCount),
     [inventoryRows, visibleInventoryCount],
@@ -4958,6 +4985,20 @@ export default function App() {
     return ducatSort.direction === "desc" ? " v" : " ^";
   }
 
+  function toggleInventorySort() {
+    setInventorySort((current) => {
+      if (current === null) {
+        return "asc";
+      }
+
+      if (current === "asc") {
+        return "desc";
+      }
+
+      return null;
+    });
+  }
+
   function clearMasteryProgress() {
     const confirmed = window.confirm(
       "Очистить все освоенные предметы? Отметки mastery будут сброшены для всего каталога.",
@@ -5344,22 +5385,51 @@ export default function App() {
                     </div>
                   </div>
 
-                  <div className="pricing-toolbar">
-                    <div className="filter-row pricing-filter-row" aria-label="Фильтр инвентаря по освоению">
-                      {PRICING_MASTERY_FILTERS.map((filter) => (
-                        <button
-                          key={filter.id}
-                          className={`filter-chip${inventoryMasteryFilter === filter.id ? " is-active" : ""}`}
-                          type="button"
-                          onClick={() => setInventoryMasteryFilter(filter.id)}
-                          disabled={
-                            filter.id !== "all" &&
-                            masteryCatalogState !== "ready"
-                          }
-                        >
-                          {filter.label}
-                        </button>
-                      ))}
+                  <div className="pricing-toolbar inventory-toolbar">
+                    <div className="inventory-toolbar-row">
+                      <div
+                        className="filter-row pricing-filter-row"
+                        aria-label="Фильтр инвентаря по освоению"
+                      >
+                        {PRICING_MASTERY_FILTERS.map((filter) => (
+                          <button
+                            key={filter.id}
+                            className={`filter-chip${inventoryMasteryFilter === filter.id ? " is-active" : ""}`}
+                            type="button"
+                            onClick={() => setInventoryMasteryFilter(filter.id)}
+                            disabled={
+                              filter.id !== "all" &&
+                              masteryCatalogState !== "ready"
+                            }
+                          >
+                            {filter.label}
+                          </button>
+                        ))}
+                      </div>
+                      <button
+                        className={`inventory-sort-control${inventorySort ? " is-active" : ""}`}
+                        type="button"
+                        onClick={toggleInventorySort}
+                        aria-pressed={inventorySort !== null}
+                        aria-label="Сортировка инвентаря по названию"
+                        title="Сортировка инвентаря по названию"
+                      >
+                        <span className="inventory-sort-control-icon" aria-hidden="true">
+                          <span />
+                          <span />
+                          <span />
+                        </span>
+                        <span className="inventory-sort-control-copy">
+                          <strong>Название</strong>
+                          <span>
+                            {inventorySort === "asc"
+                              ? "A → Я"
+                              : inventorySort === "desc"
+                                ? "Я → A"
+                                : "↕"}
+                          </span>
+                        </span>
+                      </button>
                     </div>
                     {masteryCatalogState === "loading" && (
                       <span className="table-note table-note-inline">
